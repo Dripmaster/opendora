@@ -14,6 +14,8 @@ DM이나 멘션으로 말 걸면, 자연어 요청을 TODO로 쪼개고 Codex로
 
 - **DM / 멘션** – 봇에게 DM을 보내거나 채널에서 멘션하면 요청으로 인식한다.
 - **세션 단위 처리** – 채널·유저별로 세션을 나누어 대화를 유지한다.
+- **채널·카테고리 자동 생성 및 라우팅** – 주제가 바뀌면 모델이 판단해 **새 카테고리·채널을 자동 생성**하고, 해당 채널로 대화를 이관한다. 없으면 카테고리를 만들고, 그 안에 채널을 만들어 라우팅한다.
+- **컨텍스트 로테이션** – 오프로드가 많아지면 **active / archive 카테고리**를 사용해 새 채널을 만들고, 기존 채널은 아카이브로 옮긴 뒤 새 대화는 새 채널에서 이어간다.
 - **HITL(선택)** – 위험도가 높다고 판단되면 승인 대기 후 실행할 수 있다.
 - **서브에이전트 스레드** – TODO 하나마다 Discord 스레드를 만들어 진행 상황을 따로 보고한다.
 - **메모** – 채널 토픽에 저장된 메모를 조회하는 명령을 지원한다.
@@ -97,6 +99,10 @@ uv run --directory apps/orchestrator_py orchestrator
 | `CONTEXT_MAX_ESTIMATED_TOKENS` | `12000` | 컨텍스트당 최대 토큰 수(추정) |
 | `CONTEXT_KEEP_RECENT_MESSAGES` | `10` | 유지할 최근 메시지 개수 |
 | `CONTEXT_RETRIEVE_TOP_K` | `4` | 검색 시 가져올 오프로드 개수 |
+| `CONTEXT_CHANNEL_ROUTER_ENABLED` | `true` | 모델 기반 채널·카테고리 라우팅(자동 생성) 사용 여부 |
+| `CONTEXT_CHANNEL_ROTATION_ENABLED` | `false` | 오프로드 많을 때 채널 로테이션(active/archive) 사용 여부 |
+| `CONTEXT_ACTIVE_CATEGORY_NAME` | `opendora-active` | 로테이션 시 새 채널을 둘 카테고리 이름 |
+| `CONTEXT_ARCHIVE_CATEGORY_NAME` | `opendora-archive` | 로테이션 시 기존 채널을 옮길 아카이브 카테고리 이름 |
 | `DEEP_AGENT_ENABLED` | `true` | Deep Agent(TODO·서브에이전트) 사용 여부 |
 | `DEEP_AGENT_MAX_SUBAGENTS` | `3` | 한 번에 둘 수 있는 서브에이전트(라운드당) 상한 |
 | `CODEX_BIN` | `codex` | Codex CLI 실행 파일 이름 |
