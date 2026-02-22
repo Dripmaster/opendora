@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Awaitable, Callable, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -19,6 +21,7 @@ class DeepAgentState(TypedDict, total=False):
     used_offloads: int
     live_messages: int
     external_context_count: int
+    filesystem_context: list[str]
     mode: str
     route_reason: str
     todo_list: list[dict[str, Any]]
@@ -171,7 +174,10 @@ class DeepAgentService:
                 {
                     "repoPath": state["repo_path"],
                     "userMessage": state["user_message"],
-                    "offloadedContext": state.get("offloaded_context", []),
+                    "offloadedContext": [
+                        *state.get("offloaded_context", []),
+                        *state.get("filesystem_context", []),
+                    ],
                     "liveConversation": state.get("live_conversation", []),
                     "maxTasks": self.options.max_subagents,
                 }
@@ -412,8 +418,26 @@ class DeepAgentService:
             )
             return {"final_response": aggregated.assistant_message.strip() or "(empty response)"}
 
+        async def filesystem_tool_node(state: DeepAgentState) -> DeepAgentState:
+            summaries = build_warpgrep_filesystem_context(
+                repo_path=state["repo_path"],
+                user_message=state["user_message"],
+            )
+            if summaries and on_progress:
+                await maybe_await(
+                    on_progress(
+                        {
+                            "stage": "planning",
+                            "message": f"warpgrep 파일시스템 컨텍스트 {len(summaries)}개를 추가했습니다.",
+                        }
+                    )
+                )
+            return {"filesystem_context": summaries}
+
+
         graph.add_node("prepare_context", prepare_context)
         graph.add_node("route", route)
+        graph.add_node("filesystem_tool", filesystem_tool_node)
         graph.add_node("main_direct", main_direct)
         graph.add_node("plan", plan)
         graph.add_node("run_subagents", run_subagents)
@@ -422,8 +446,9 @@ class DeepAgentService:
 
         graph.add_edge(START, "prepare_context")
         graph.add_edge("prepare_context", "route")
-        graph.add_conditional_edges("route", lambda s: "main_direct" if s.get("mode") == "main_direct" else "plan")
+        graph.add_conditional_edges("route", lambda s: "main_direct" if s.get("mode") == "main_direct" else "filesystem_tool")
         graph.add_edge("main_direct", END)
+        graph.add_edge("filesystem_tool", "plan")
         graph.add_edge("plan", "run_subagents")
         graph.add_edge("run_subagents", "review_and_replan")
         graph.add_conditional_edges("review_and_replan", lambda s: "aggregate" if s.get("done") else "run_subagents")
@@ -469,6 +494,32 @@ async def maybe_await(value: Any) -> Any:
     if hasattr(value, "__await__"):
         return await value
     return value
+
+
+def build_warpgrep_filesystem_context(repo_path: str, user_message: str, limit: int = 8) -> list[str]:
+    keywords = [token.strip(" .,!?()[]{}\"'\n\t") for token in user_message.split()]
+    keywords = [x.lower() for x in keywords if len(x) >= 3]
+    if not keywords:
+        return []
+
+    ranked: list[tuple[int, str, str]] = []
+    root = Path(repo_path)
+    if not root.exists() or not root.is_dir():
+        return []
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = Path(dirpath).relative_to(root)
+        dirnames[:] = [d for d in dirnames if d not in {".git", ".venv", "node_modules", "__pycache__", ".mypy_cache", ".pytest_cache"}]
+        for fname in filenames:
+            rel_path = (rel_dir / fname).as_posix() if str(rel_dir) != "." else fname
+            lower = rel_path.lower()
+            score = sum(1 for token in keywords if token in lower)
+            if score <= 0:
+                continue
+            ranked.append((score, rel_path, f"[warpgrep] file={rel_path} score={score}"))
+
+    ranked.sort(key=lambda x: (-x[0], x[1]))
+    return [item[2] for item in ranked[:limit]]
 
 
 def map_selected(items: list[str], selected_ids: list[str], prefix: str) -> list[str]:

@@ -14,8 +14,10 @@ class FakeRunResult:
 class FakeCodex:
     def __init__(self, outputs: list[str]):
         self.outputs = outputs
+        self.prompts: list[str] = []
 
     async def run(self, repo_path: str, prompt: str):
+        self.prompts.append(prompt)
         text = self.outputs.pop(0)
         return FakeRunResult(assistant_message=text)
 
@@ -93,3 +95,28 @@ async def test_deep_agent_replans_and_runs_additional_round(tmp_path):
     assert result.mode == "subagent_pipeline"
     assert result.subagent_count == 2
     assert result.final_response == "final-aggregate"
+
+
+async def test_deep_agent_filesystem_tool_node_injects_warpgrep_context(tmp_path):
+    (tmp_path / "warpgrep_pattern_docs.txt").write_text("notes")
+    codex = FakeCodex(
+        [
+            '{"mode":"subagent_pipeline","reason":"complex"}',
+            '{"todos":[{"id":"T1","title":"first","instructions":"do-1","priority":"high","dependsOn":[],"doneDefinition":"done"}]}',
+            '{"offloadIds":[],"liveMessageIds":[]}',
+            "round1-output",
+            '{"done":true,"reason":"complete","nextTodos":[]}',
+            "final-aggregate",
+        ]
+    )
+    tools = DeepAgentToolsService(codex=codex)  # type: ignore[arg-type]
+    context = ContextOffloadService(
+        ContextOffloadOptions(True, str(tmp_path / "ctx"), 12000, 10, 4)
+    )
+    agent = DeepAgentService(codex=codex, context_offload=context, tools=tools, options=DeepAgentOptions(True, 3))  # type: ignore[arg-type]
+
+    result = await agent.execute("c:u", "warpgrep pattern 파일 찾아줘", str(tmp_path))
+
+    assert result.mode == "subagent_pipeline"
+    plan_prompt = codex.prompts[1]
+    assert "[warpgrep] file=warpgrep_pattern_docs.txt" in plan_prompt
