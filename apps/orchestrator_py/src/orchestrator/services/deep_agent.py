@@ -73,6 +73,17 @@ class DeepAgentService:
         max_rounds = 3
         graph = StateGraph(DeepAgentState)
 
+        async def save_user_request(state: DeepAgentState) -> DeepAgentState:
+            """유저 요청 저장 시 오프로드."""
+            await self.context_offload.persist_user_request(
+                session_key=state["session_key"],
+                user_message=state["user_message"],
+                summarize_offload=lambda offload: self.tools.invoke_summarize_offload(
+                    {"repoPath": state["repo_path"], "messages": offload["messages"]}
+                ),
+            )
+            return {}
+
         async def prepare_context(state: DeepAgentState) -> DeepAgentState:
             capsule = await self.context_offload.build_capsule(
                 session_key=state["session_key"],
@@ -194,6 +205,13 @@ class DeepAgentService:
             return {"todo_list": tasks, "todo_results": [], "subagent_outputs": [], "round": 1}
 
         async def run_subagents(state: DeepAgentState) -> DeepAgentState:
+            # 서브에이전트한테 일 할당 전 오프로드
+            await self.context_offload.compact_session(
+                session_key=state["session_key"],
+                summarize_offload=lambda offload: self.tools.invoke_summarize_offload(
+                    {"repoPath": state["repo_path"], "messages": offload["messages"]}
+                ),
+            )
             tasks = state.get("todo_list", [])
             outputs: list[str] = []
             results: list[dict[str, Any]] = []
@@ -332,6 +350,13 @@ class DeepAgentService:
                         )
                     )
 
+            # 서브에이전트 결과 후 오프로드
+            await self.context_offload.compact_session(
+                session_key=state["session_key"],
+                summarize_offload=lambda offload: self.tools.invoke_summarize_offload(
+                    {"repoPath": state["repo_path"], "messages": offload["messages"]}
+                ),
+            )
             all_results = [*prev_results, *results]
             all_outputs = [*prev_outputs, *outputs]
             return {
@@ -435,6 +460,7 @@ class DeepAgentService:
             return {"filesystem_context": summaries}
 
 
+        graph.add_node("save_user_request", save_user_request)
         graph.add_node("prepare_context", prepare_context)
         graph.add_node("route", route)
         graph.add_node("filesystem_tool", filesystem_tool_node)
@@ -444,7 +470,8 @@ class DeepAgentService:
         graph.add_node("review_and_replan", review_and_replan)
         graph.add_node("aggregate", aggregate)
 
-        graph.add_edge(START, "prepare_context")
+        graph.add_edge(START, "save_user_request")
+        graph.add_edge("save_user_request", "prepare_context")
         graph.add_edge("prepare_context", "route")
         graph.add_conditional_edges("route", lambda s: "main_direct" if s.get("mode") == "main_direct" else "filesystem_tool")
         graph.add_edge("main_direct", END)
@@ -471,10 +498,10 @@ class DeepAgentService:
             subagent_count=state.get("subagent_count", 0),
         )
 
-    async def persist_turn(self, session_key: str, repo_path: str, user_message: str, assistant_message: str) -> dict[str, int]:
+    async def persist_turn(self, session_key: str, repo_path: str, assistant_message: str) -> dict[str, int]:
+        """턴 종료 시 assistant 응답만 저장 후 오프로드 (user 요청은 이미 save_user_request에서 저장됨)."""
         stats = await self.context_offload.persist_turn(
             session_key=session_key,
-            user_message=user_message,
             assistant_message=assistant_message,
             summarize_offload=lambda offload: self.tools.invoke_summarize_offload(
                 {

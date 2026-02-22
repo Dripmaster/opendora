@@ -246,7 +246,6 @@ class DiscordGateway:
             persisted = await self.deep_agent.persist_turn(
                 session_key=key,
                 repo_path=self.env.DEFAULT_REPO_PATH,
-                user_message=request.prompt,
                 assistant_message=result.final_response,
             )
             elapsed_ms = int((time.time() - started_at) * 1000)

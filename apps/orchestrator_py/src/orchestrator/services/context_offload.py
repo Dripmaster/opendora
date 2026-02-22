@@ -101,35 +101,76 @@ class ContextOffloadService:
             live_messages=len(picked_live),
         )
 
-    async def persist_turn(
+    async def _append_and_compact(
         self,
-        session_key: str,
-        user_message: str,
-        assistant_message: str,
-        summarize_offload: OffloadSummarizer | None = None,
-    ) -> PersistedTurnStats:
-        if not self.options.enabled:
-            return PersistedTurnStats(0, 0, 0)
-
-        state = self._load_session(session_key)
-        now = now_iso()
-        state["messages"].append({"id": make_id(), "role": "user", "content": user_message, "createdAt": now})
-        state["messages"].append(
-            {"id": make_id(), "role": "assistant", "content": assistant_message, "createdAt": now_iso()}
-        )
-
+        state: dict[str, Any],
+        summarize_offload: OffloadSummarizer | None,
+    ) -> int:
         offloads_created = 0
-        while estimate_tokens(state["messages"]) > self.options.max_estimated_tokens:
+        while len(state["messages"]) > self.options.keep_recent_messages:
             overflow = len(state["messages"]) - self.options.keep_recent_messages
-            if overflow < 2:
-                break
             chunk_size = max(2, min(12, overflow))
             chunk = state["messages"][:chunk_size]
             state["messages"] = state["messages"][chunk_size:]
             offload = await summarize_chunk(chunk, summarize_offload)
             state["offloads"].append(offload)
             offloads_created += 1
+        return offloads_created
 
+    async def persist_user_request(
+        self,
+        session_key: str,
+        user_message: str,
+        summarize_offload: OffloadSummarizer | None = None,
+    ) -> PersistedTurnStats:
+        """유저 요청 저장 시: user 메시지만 append 후 오프로드."""
+        if not self.options.enabled:
+            return PersistedTurnStats(0, 0, 0)
+        state = self._load_session(session_key)
+        now = now_iso()
+        state["messages"].append({"id": make_id(), "role": "user", "content": user_message, "createdAt": now})
+        offloads_created = await self._append_and_compact(state, summarize_offload)
+        state["updatedAt"] = now_iso()
+        self._save_session(session_key, state)
+        return PersistedTurnStats(
+            offloads_created=offloads_created,
+            live_messages=len(state["messages"]),
+            total_offloads=len(state["offloads"]),
+        )
+
+    async def compact_session(
+        self,
+        session_key: str,
+        summarize_offload: OffloadSummarizer | None = None,
+    ) -> PersistedTurnStats:
+        """append 없이 현재 세션만 live 초과분 오프로드 (일 할당 전/서브에이전트 결과 후 등)."""
+        if not self.options.enabled:
+            return PersistedTurnStats(0, 0, 0)
+        state = self._load_session(session_key)
+        offloads_created = await self._append_and_compact(state, summarize_offload)
+        state["updatedAt"] = now_iso()
+        self._save_session(session_key, state)
+        return PersistedTurnStats(
+            offloads_created=offloads_created,
+            live_messages=len(state["messages"]),
+            total_offloads=len(state["offloads"]),
+        )
+
+    async def persist_turn(
+        self,
+        session_key: str,
+        assistant_message: str,
+        summarize_offload: OffloadSummarizer | None = None,
+    ) -> PersistedTurnStats:
+        """턴 종료 시: assistant 메시지만 append 후 오프로드 (user는 이미 persist_user_request로 저장됨)."""
+        if not self.options.enabled:
+            return PersistedTurnStats(0, 0, 0)
+        state = self._load_session(session_key)
+        now = now_iso()
+        state["messages"].append(
+            {"id": make_id(), "role": "assistant", "content": assistant_message, "createdAt": now}
+        )
+        offloads_created = await self._append_and_compact(state, summarize_offload)
         state["updatedAt"] = now_iso()
         self._save_session(session_key, state)
         return PersistedTurnStats(

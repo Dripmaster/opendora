@@ -30,7 +30,7 @@ class FakeDeepAgent:
             subagent_count=0,
         )
 
-    async def persist_turn(self, session_key: str, repo_path: str, user_message: str, assistant_message: str):
+    async def persist_turn(self, session_key: str, repo_path: str, assistant_message: str):
         return {"offloadsCreated": 0, "liveMessages": 2, "totalOffloads": 0}
 
 

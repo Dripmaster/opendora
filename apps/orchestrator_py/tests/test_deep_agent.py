@@ -36,7 +36,9 @@ class FakeCodex:
 
 
 async def test_deep_agent_main_direct(tmp_path):
-    codex = FakeCodex(['{"mode":"main_direct","reason":"simple"}', "direct-answer"])
+    codex = FakeCodex(
+        ['{"offloadIds":[],"liveMessageIds":[]}', '{"mode":"main_direct","reason":"simple"}', "direct-answer"]
+    )
     tools = DeepAgentToolsService(codex=codex)  # type: ignore[arg-type]
     context = ContextOffloadService(
         ContextOffloadOptions(True, str(tmp_path / "ctx"), 12000, 10, 4)
@@ -51,6 +53,7 @@ async def test_deep_agent_main_direct(tmp_path):
 async def test_deep_agent_subagent_blocked_and_aggregate(tmp_path):
     codex = FakeCodex(
         [
+            '{"offloadIds":[],"liveMessageIds":[]}',
             '{"mode":"subagent_pipeline","reason":"complex"}',
             '{"todos":[{"id":"T1","title":"first","instructions":"do-1","priority":"high","dependsOn":[],"doneDefinition":"done"},{"id":"T2","title":"second","instructions":"do-2","priority":"medium","dependsOn":["TX"],"doneDefinition":"done"}]}',
             '{"offloadIds":[],"liveMessageIds":[]}',
@@ -74,6 +77,7 @@ async def test_deep_agent_subagent_blocked_and_aggregate(tmp_path):
 async def test_deep_agent_replans_and_runs_additional_round(tmp_path):
     codex = FakeCodex(
         [
+            '{"offloadIds":[],"liveMessageIds":[]}',
             '{"mode":"subagent_pipeline","reason":"complex"}',
             '{"todos":[{"id":"T1","title":"first","instructions":"do-1","priority":"high","dependsOn":[],"doneDefinition":"done"}]}',
             '{"offloadIds":[],"liveMessageIds":[]}',
@@ -101,6 +105,7 @@ async def test_deep_agent_filesystem_tool_node_injects_warpgrep_context(tmp_path
     (tmp_path / "warpgrep_pattern_docs.txt").write_text("notes")
     codex = FakeCodex(
         [
+            '{"offloadIds":[],"liveMessageIds":[]}',
             '{"mode":"subagent_pipeline","reason":"complex"}',
             '{"todos":[{"id":"T1","title":"first","instructions":"do-1","priority":"high","dependsOn":[],"doneDefinition":"done"}]}',
             '{"offloadIds":[],"liveMessageIds":[]}',
@@ -118,5 +123,5 @@ async def test_deep_agent_filesystem_tool_node_injects_warpgrep_context(tmp_path
     result = await agent.execute("c:u", "warpgrep pattern 파일 찾아줘", str(tmp_path))
 
     assert result.mode == "subagent_pipeline"
-    plan_prompt = codex.prompts[1]
+    plan_prompt = codex.prompts[2]  # 0=select_context, 1=route, 2=plan
     assert "[warpgrep] file=warpgrep_pattern_docs.txt" in plan_prompt

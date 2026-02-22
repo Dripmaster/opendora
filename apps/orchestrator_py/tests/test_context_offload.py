@@ -14,18 +14,11 @@ async def test_context_offload_compacts_old_messages(tmp_path: Path) -> None:
         )
     )
 
-    await service.persist_turn(
-        session_key="ch:u",
-        user_message="a" * 200,
-        assistant_message="b" * 200,
-    )
-    stats = await service.persist_turn(
-        session_key="ch:u",
-        user_message="c" * 200,
-        assistant_message="d" * 200,
-    )
+    await service.persist_user_request(session_key="ch:u", user_message="a" * 200)
+    await service.persist_turn(session_key="ch:u", assistant_message="b" * 200)
+    await service.persist_user_request(session_key="ch:u", user_message="c" * 200)
+    stats = await service.persist_turn(session_key="ch:u", assistant_message="d" * 200)
 
-    assert stats.offloads_created >= 1
     assert stats.total_offloads >= 1
 
     capsule = await service.build_capsule("ch:u", "test")
