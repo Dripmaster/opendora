@@ -566,27 +566,37 @@ def build_subagent_prompt(
     thread_user_inputs: list[str],
     user_message: str,
 ) -> str:
+    safe_task = {
+        "id": sanitize_prompt_segment(str(task.get("id", "")), 80),
+        "title": sanitize_prompt_segment(str(task.get("title", "")), 240),
+        "instructions": sanitize_prompt_segment(str(task.get("instructions", "")), 2400),
+        "doneDefinition": sanitize_prompt_segment(str(task.get("doneDefinition", "")), 600),
+    }
+    safe_offloads = [sanitize_prompt_segment(x, 900) for x in offloaded_context[:6]]
+    safe_live = [sanitize_prompt_segment(x, 700) for x in live_conversation[:10]]
+    safe_thread_inputs = [sanitize_prompt_segment(x, 700) for x in thread_user_inputs[:10]]
+    safe_user_message = sanitize_prompt_segment(user_message, 1200)
     return "\n".join(
         [
             "Role: subagent worker.",
             "Goal: execute exactly one TODO and report concise result.",
             f"Task index: {index}/{total}",
-            f"[TODO ID] {task.get('id', '')}",
-            f"[TODO TITLE] {task.get('title', '')}",
-            f"[TODO INSTRUCTIONS] {task.get('instructions', '')}",
-            f"[DONE DEFINITION] {task.get('doneDefinition', '')}",
+            f"[TODO ID] {safe_task['id']}",
+            f"[TODO TITLE] {safe_task['title']}",
+            f"[TODO INSTRUCTIONS] {safe_task['instructions']}",
+            f"[DONE DEFINITION] {safe_task['doneDefinition']}",
             "",
             "[Relevant Offloaded Context]",
-            *offloaded_context,
+            *safe_offloads,
             "",
             "[Relevant Live Conversation]",
-            *live_conversation,
+            *safe_live,
             "",
             "[Thread User Inputs For This TODO]",
-            *thread_user_inputs,
+            *safe_thread_inputs,
             "",
             "[Original User Request]",
-            user_message,
+            safe_user_message,
         ]
     )
 
@@ -652,4 +662,33 @@ def truncate(value: str, max_len: int) -> str:
 
 
 def is_separator_chunk_error(exc: Exception) -> bool:
-    return "Separator is found, but chunk is longer than limit" in str(exc)
+    text = str(exc)
+    return (
+        "Separator is found, but chunk is longer than limit" in text
+        or "Separator is not found, and chunk exceed the limit" in text
+    )
+
+
+def sanitize_prompt_segment(value: str, max_len: int) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    # Prevent very long unbroken chunks that can break downstream splitters.
+    text = break_long_tokens(text, token_len=240)
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1] + "..."
+
+
+def break_long_tokens(value: str, token_len: int = 240) -> str:
+    parts: list[str] = []
+    for line in value.split("\n"):
+        if len(line) <= token_len:
+            parts.append(line)
+            continue
+        cursor = 0
+        while cursor < len(line):
+            parts.append(line[cursor : cursor + token_len])
+            cursor += token_len
+    return "\n".join(parts)
