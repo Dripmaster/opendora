@@ -179,6 +179,38 @@ class DiscordGateway:
             subagent_threads: dict[str, Any] = {}
             subagent_thread_refs: dict[str, str] = {}
 
+            async def ensure_subagent_thread(todo_id: str, todo_title: str) -> Any:
+                thread_target = subagent_threads.get(todo_id)
+                if thread_target is not None:
+                    return thread_target
+
+                thread_target, thread_ref, thread_id = await self._create_subagent_thread(
+                    message,
+                    request.id,
+                    todo_id,
+                    todo_title,
+                )
+                subagent_threads[todo_id] = thread_target
+
+                queue_key = self._queue_key(request.id, todo_id)
+                run_queue_keys.add(queue_key)
+                self.todo_input_queues.setdefault(queue_key, [])
+
+                if thread_id:
+                    self.thread_routes[str(thread_id)] = ThreadRoute(
+                        request_id=request.id,
+                        session_key=key,
+                        todo_id=todo_id,
+                        queue_key=queue_key,
+                    )
+                    run_thread_ids.append(str(thread_id))
+
+                if thread_ref:
+                    subagent_thread_refs[todo_id] = thread_ref
+                    await message.reply(f"서브에이전트 {todo_id} 진행 스레드 생성: {thread_ref}")
+
+                return thread_target
+
             async def progress(event: dict[str, Any]) -> None:
                 stage = str(event.get("stage", "unknown"))
                 todo_id = str(event.get("todo_id", "")).strip()
@@ -186,50 +218,17 @@ class DiscordGateway:
                 raw_message = str(event.get("message", ""))
                 if stage == "subagent_debug_prompt":
                     chunks = split_for_discord(raw_message, max_len=1700)
-                    if stage in {"subagent_start", "subagent_done", "subagent_event", "subagent_debug_prompt"} and todo_id:
-                        thread_target = subagent_threads.get(todo_id)
-                        if thread_target is None:
-                            thread_target, thread_ref, thread_id = await self._create_subagent_thread(message, request.id, todo_id, todo_title)
-                            subagent_threads[todo_id] = thread_target
-                            queue_key = self._queue_key(request.id, todo_id)
-                            run_queue_keys.add(queue_key)
-                            self.todo_input_queues.setdefault(queue_key, [])
-                            if thread_id:
-                                self.thread_routes[str(thread_id)] = ThreadRoute(
-                                    request_id=request.id,
-                                    session_key=key,
-                                    todo_id=todo_id,
-                                    queue_key=queue_key,
-                                )
-                                run_thread_ids.append(str(thread_id))
-                            if thread_ref:
-                                subagent_thread_refs[todo_id] = thread_ref
-                                await message.reply(f"서브에이전트 {todo_id} 진행 스레드 생성: {thread_ref}")
-                        await self._send_message(subagent_threads.get(todo_id, message), "진행중[subagent_debug_prompt]: separator 오류 직전 프롬프트 원문")
-                        for idx, chunk in enumerate(chunks, start=1):
-                            await self._send_message(subagent_threads.get(todo_id, message), f"[prompt part {idx}/{len(chunks)}]\n{chunk}")
-                        return
+                    target = message
+                    if todo_id:
+                        target = await ensure_subagent_thread(todo_id, todo_title)
+                    await self._send_message(target, "진행중[subagent_debug_prompt]: separator 오류 직전 프롬프트 원문")
+                    for idx, chunk in enumerate(chunks, start=1):
+                        await self._send_message(target, f"[prompt part {idx}/{len(chunks)}]\n{chunk}")
+                    return
                 text = f"진행중[{stage}]: {truncate_for_discord(raw_message, 300)}"
                 if stage in {"subagent_start", "subagent_done", "subagent_event"} and todo_id:
-                    thread_target = subagent_threads.get(todo_id)
-                    if thread_target is None:
-                        thread_target, thread_ref, thread_id = await self._create_subagent_thread(message, request.id, todo_id, todo_title)
-                        subagent_threads[todo_id] = thread_target
-                        queue_key = self._queue_key(request.id, todo_id)
-                        run_queue_keys.add(queue_key)
-                        self.todo_input_queues.setdefault(queue_key, [])
-                        if thread_id:
-                            self.thread_routes[str(thread_id)] = ThreadRoute(
-                                request_id=request.id,
-                                session_key=key,
-                                todo_id=todo_id,
-                                queue_key=queue_key,
-                            )
-                            run_thread_ids.append(str(thread_id))
-                        if thread_ref:
-                            subagent_thread_refs[todo_id] = thread_ref
-                            await message.reply(f"서브에이전트 {todo_id} 진행 스레드 생성: {thread_ref}")
-                    await self._send_message(subagent_threads.get(todo_id, message), text)
+                    target = await ensure_subagent_thread(todo_id, todo_title)
+                    await self._send_message(target, text)
                     if stage == "subagent_done":
                         self._clear_todo_thread_route(request.id, todo_id)
                     return

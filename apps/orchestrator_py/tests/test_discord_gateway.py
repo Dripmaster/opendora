@@ -54,6 +54,22 @@ class FakeDeepAgentWithSubagents(FakeDeepAgent):
         )
 
 
+class FakeDeepAgentWithStageRepeatedTodo(FakeDeepAgent):
+    async def execute(self, session_key: str, user_message: str, repo_path: str, on_progress=None, todo_input_provider=None):
+        if on_progress:
+            await on_progress({"stage": "subagent_start", "message": "TODO T1 시작: first", "todo_id": "T1", "todo_title": "first"})
+            await on_progress({"stage": "subagent_event", "message": "T1 progress", "todo_id": "T1", "todo_title": "first"})
+            await on_progress({"stage": "subagent_debug_prompt", "message": "debug prompt chunk body", "todo_id": "T1", "todo_title": "first"})
+            await on_progress({"stage": "subagent_done", "message": "TODO T1 완료", "todo_id": "T1", "todo_title": "first", "status": "done"})
+        return SimpleNamespace(
+            final_response="done",
+            mode="subagent_pipeline",
+            used_offloads=0,
+            live_messages=0,
+            subagent_count=1,
+        )
+
+
 class FakeSeedMessage:
     def __init__(self):
         self.created_thread = FakeThread()
@@ -183,6 +199,30 @@ async def test_subagent_progress_is_sent_to_per_subagent_thread_when_available()
     assert "T1-first" in str(m1.channel.seed_messages[0].thread_name)
     assert any("진행중[subagent_start]" in x for x in m1.channel.seed_messages[0].created_thread.messages)
     assert any("진행중[subagent_event]" in x for x in m1.channel.seed_messages[0].created_thread.messages)
+    assert any("진행중[subagent_done]" in x for x in m1.channel.seed_messages[0].created_thread.messages)
+
+
+async def test_subagent_thread_is_created_once_per_todo_across_stages():
+    env = AppEnv.model_validate(
+        {
+            "DISCORD_BOT_TOKEN": "x",
+            "NATURAL_CHAT_ENABLED": True,
+            "HITL_REQUIRED": False,
+            "HITL_TTL_SEC": 600,
+            "DEFAULT_REPO_PATH": ".",
+        }
+    )
+    gateway = DiscordGateway(env, FakeDeepAgentWithStageRepeatedTodo(), FakeLogger())  # type: ignore[arg-type]
+
+    m1 = FakeGuildMessage("작업해줘")
+    await gateway.handle_message(m1)
+
+    assert len(m1.channel.seed_messages) == 1
+    assert sum("서브에이전트 T1 진행 스레드 생성" in x for x in m1.replies) == 1
+    assert any("진행중[subagent_start]" in x for x in m1.channel.seed_messages[0].created_thread.messages)
+    assert any("진행중[subagent_event]" in x for x in m1.channel.seed_messages[0].created_thread.messages)
+    assert any("진행중[subagent_debug_prompt]: separator 오류 직전 프롬프트 원문" in x for x in m1.channel.seed_messages[0].created_thread.messages)
+    assert any("[prompt part 1/1]\ndebug prompt chunk body" in x for x in m1.channel.seed_messages[0].created_thread.messages)
     assert any("진행중[subagent_done]" in x for x in m1.channel.seed_messages[0].created_thread.messages)
 
 
