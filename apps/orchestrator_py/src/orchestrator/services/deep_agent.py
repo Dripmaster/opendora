@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +41,8 @@ class DeepAgentState(TypedDict, total=False):
 class DeepAgentOptions:
     enabled: bool
     max_subagents: int
+    warpgrep_max_files: int = 200
+    warpgrep_max_depth: int = 4
 
 
 @dataclass(slots=True)
@@ -444,9 +447,11 @@ class DeepAgentService:
             return {"final_response": aggregated.assistant_message.strip() or "(empty response)"}
 
         async def filesystem_tool_node(state: DeepAgentState) -> DeepAgentState:
-            summaries = build_warpgrep_filesystem_context(
+            summaries = await collect_warpgrep_filesystem_context(
                 repo_path=state["repo_path"],
                 user_message=state["user_message"],
+                max_files=self.options.warpgrep_max_files,
+                max_depth=self.options.warpgrep_max_depth,
             )
             if summaries and on_progress:
                 await maybe_await(
@@ -523,7 +528,30 @@ async def maybe_await(value: Any) -> Any:
     return value
 
 
-def build_warpgrep_filesystem_context(repo_path: str, user_message: str, limit: int = 8) -> list[str]:
+async def collect_warpgrep_filesystem_context(
+    repo_path: str,
+    user_message: str,
+    max_files: int,
+    max_depth: int,
+    limit: int = 8,
+) -> list[str]:
+    return await asyncio.to_thread(
+        build_warpgrep_filesystem_context,
+        repo_path,
+        user_message,
+        limit,
+        max_files,
+        max_depth,
+    )
+
+
+def build_warpgrep_filesystem_context(
+    repo_path: str,
+    user_message: str,
+    limit: int = 8,
+    max_files: int = 200,
+    max_depth: int = 4,
+) -> list[str]:
     keywords = [token.strip(" .,!?()[]{}\"'\n\t") for token in user_message.split()]
     keywords = [x.lower() for x in keywords if len(x) >= 3]
     if not keywords:
@@ -534,19 +562,32 @@ def build_warpgrep_filesystem_context(repo_path: str, user_message: str, limit: 
     if not root.exists() or not root.is_dir():
         return []
 
+    summaries: list[str] = [f"[warpgrep] limits max_files={max_files} max_depth={max_depth}"]
+
+    scanned_files = 0
     for dirpath, dirnames, filenames in os.walk(root):
         rel_dir = Path(dirpath).relative_to(root)
+        rel_depth = 0 if str(rel_dir) == "." else len(rel_dir.parts)
         dirnames[:] = [d for d in dirnames if d not in {".git", ".venv", "node_modules", "__pycache__", ".mypy_cache", ".pytest_cache"}]
+        if rel_depth >= max_depth:
+            dirnames[:] = []
+
         for fname in filenames:
+            if scanned_files >= max_files:
+                break
+            scanned_files += 1
             rel_path = (rel_dir / fname).as_posix() if str(rel_dir) != "." else fname
             lower = rel_path.lower()
             score = sum(1 for token in keywords if token in lower)
             if score <= 0:
                 continue
             ranked.append((score, rel_path, f"[warpgrep] file={rel_path} score={score}"))
+        if scanned_files >= max_files:
+            break
 
     ranked.sort(key=lambda x: (-x[0], x[1]))
-    return [item[2] for item in ranked[:limit]]
+    summaries.extend(item[2] for item in ranked[:limit])
+    return summaries
 
 
 def map_selected(items: list[str], selected_ids: list[str], prefix: str) -> list[str]:

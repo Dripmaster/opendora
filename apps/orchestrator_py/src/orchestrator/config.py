@@ -38,6 +38,8 @@ class AppEnv(BaseSettings):
 
     DEEP_AGENT_ENABLED: bool = True
     DEEP_AGENT_MAX_SUBAGENTS: int = Field(default=3, gt=0)
+    WARPGREP_MAX_FILES: int = Field(default=200, gt=0)
+    WARPGREP_MAX_DEPTH: int = Field(default=4, ge=0)
 
     CODEX_BIN: str = "codex"
     CODEX_TIMEOUT_MS: int = Field(default=900000, gt=0)
