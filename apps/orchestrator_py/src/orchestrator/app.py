@@ -40,6 +40,7 @@ class OrchestratorApp:
             options=DeepAgentOptions(
                 enabled=self.env.DEEP_AGENT_ENABLED,
                 max_subagents=self.env.DEEP_AGENT_MAX_SUBAGENTS,
+                max_rounds=self.env.DEEP_AGENT_MAX_ROUNDS,
             ),
         )
         self.discord = DiscordGateway(self.env, self.deep_agent, self.logger)

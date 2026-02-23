@@ -105,6 +105,7 @@ uv run --directory apps/orchestrator_py orchestrator
 | `CONTEXT_ARCHIVE_CATEGORY_NAME` | `opendora-archive` | 로테이션 시 기존 채널을 옮길 아카이브 카테고리 이름 |
 | `DEEP_AGENT_ENABLED` | `true` | Deep Agent(TODO·서브에이전트) 사용 여부 |
 | `DEEP_AGENT_MAX_SUBAGENTS` | `3` | 한 번에 둘 수 있는 서브에이전트(라운드당) 상한 |
+| `DEEP_AGENT_MAX_ROUNDS` | `3` | Deep Agent 재계획 최대 라운드 수(1 이상) |
 | `CODEX_BIN` | `codex` | Codex CLI 실행 파일 이름 |
 | `CODEX_TIMEOUT_MS` | `900000` | Codex 실행 타임아웃(ms) |
 | `CODEX_MODEL` | (비어 있음) | Codex 모델 오버라이드(선택) |

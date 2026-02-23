@@ -38,6 +38,7 @@ class AppEnv(BaseSettings):
 
     DEEP_AGENT_ENABLED: bool = True
     DEEP_AGENT_MAX_SUBAGENTS: int = Field(default=3, gt=0)
+    DEEP_AGENT_MAX_ROUNDS: int = Field(default=3, gt=0)
 
     CODEX_BIN: str = "codex"
     CODEX_TIMEOUT_MS: int = Field(default=900000, gt=0)

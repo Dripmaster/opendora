@@ -40,6 +40,7 @@ class DeepAgentState(TypedDict, total=False):
 class DeepAgentOptions:
     enabled: bool
     max_subagents: int
+    max_rounds: int
 
 
 @dataclass(slots=True)
@@ -70,7 +71,7 @@ class DeepAgentService:
         on_progress: ProgressHandler | None = None,
         todo_input_provider: TodoInputProvider | None = None,
     ) -> DeepAgentResult:
-        max_rounds = 3
+        max_rounds = self.options.max_rounds
         graph = StateGraph(DeepAgentState)
 
         async def save_user_request(state: DeepAgentState) -> DeepAgentState:
