@@ -125,3 +125,40 @@ async def test_deep_agent_filesystem_tool_node_injects_warpgrep_context(tmp_path
     assert result.mode == "subagent_pipeline"
     plan_prompt = codex.prompts[2]  # 0=select_context, 1=route, 2=plan
     assert "[warpgrep] file=warpgrep_pattern_docs.txt" in plan_prompt
+
+
+async def test_deep_agent_warpgrep_limits_reflected_in_plan_prompt(tmp_path):
+    nested = tmp_path / "a" / "b" / "c"
+    nested.mkdir(parents=True)
+    (tmp_path / "warpgrep_root_target.txt").write_text("root")
+    (nested / "warpgrep_deep_target.txt").write_text("deep")
+
+    codex = FakeCodex(
+        [
+            '{"offloadIds":[],"liveMessageIds":[]}',
+            '{"mode":"subagent_pipeline","reason":"complex"}',
+            '{"todos":[{"id":"T1","title":"first","instructions":"do-1","priority":"high","dependsOn":[],"doneDefinition":"done"}]}',
+            '{"offloadIds":[],"liveMessageIds":[]}',
+            "round1-output",
+            '{"done":true,"reason":"complete","nextTodos":[]}',
+            "final-aggregate",
+        ]
+    )
+    tools = DeepAgentToolsService(codex=codex)  # type: ignore[arg-type]
+    context = ContextOffloadService(
+        ContextOffloadOptions(True, str(tmp_path / "ctx"), 12000, 10, 4)
+    )
+    agent = DeepAgentService(
+        codex=codex,
+        context_offload=context,
+        tools=tools,
+        options=DeepAgentOptions(True, 3, warpgrep_max_files=1, warpgrep_max_depth=1),
+    )  # type: ignore[arg-type]
+
+    result = await agent.execute("c:u", "warpgrep target 파일 찾아줘", str(tmp_path))
+
+    assert result.mode == "subagent_pipeline"
+    plan_prompt = codex.prompts[2]  # 0=select_context, 1=route, 2=plan
+    assert "[warpgrep] limits max_files=1 max_depth=1" in plan_prompt
+    assert "[warpgrep] file=warpgrep_root_target.txt" in plan_prompt
+    assert "warpgrep_deep_target.txt" not in plan_prompt
