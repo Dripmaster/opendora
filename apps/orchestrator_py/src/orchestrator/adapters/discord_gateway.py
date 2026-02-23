@@ -96,6 +96,13 @@ class DiscordGateway:
                 if not prompt:
                     return
                 queue = self.todo_input_queues.setdefault(thread_route.queue_key, [])
+                control = parse_todo_control_command(prompt)
+                if control:
+                    queue.append(encode_todo_control_command(control))
+                    await message.reply(
+                        f"제어 명령 반영됨: {thread_route.todo_id} ({control})"
+                    )
+                    return
                 queue.append(prompt)
                 await message.reply(
                     f"입력 반영됨: {thread_route.todo_id} (대기 입력 {len(queue)}개)"
@@ -543,6 +550,22 @@ def sanitize_incoming_content(content: str, bot_id: int | None) -> str:
     if bot_id is not None:
         stripped = re.sub(rf"<@!?{bot_id}>", "", stripped)
     return re.sub(r"\s+", " ", stripped).strip()
+
+
+TODO_CONTROL_COMMANDS = {
+    "/skip": "skip",
+    "/stop-round": "stop-round",
+    "/abort": "abort",
+}
+
+
+def parse_todo_control_command(content: str) -> str | None:
+    normalized = re.sub(r"\s+", " ", content).strip().lower()
+    return TODO_CONTROL_COMMANDS.get(normalized)
+
+
+def encode_todo_control_command(command: str) -> str:
+    return f"__control__:{command}"
 
 
 def truncate_for_discord(input_text: str, max_len: int) -> str:

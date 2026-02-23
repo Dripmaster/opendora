@@ -35,6 +35,8 @@ class DeepAgentState(TypedDict, total=False):
     done: bool
     completion_reason: str
     final_response: str
+    stop_after_current_round: bool
+    abort_execution: bool
 
 
 @dataclass(slots=True)
@@ -356,15 +358,89 @@ class DeepAgentService:
                 relevant_offloads = map_selected(state.get("offloaded_context", []), selected["offloadIds"], "offload")
                 relevant_live = map_selected(state.get("live_conversation", []), selected["liveMessageIds"], "live")
                 thread_inputs: list[str] = []
+                control_flags = {"skip": False, "stop_round": False, "abort": False}
                 if todo_input_provider:
                     consumed = todo_input_provider(task["id"])
-                    thread_inputs = await maybe_await(consumed) or []
+                    raw_inputs = await maybe_await(consumed) or []
+                    for raw in raw_inputs:
+                        command = parse_control_input(raw)
+                        if command == "skip":
+                            control_flags["skip"] = True
+                        elif command == "stop-round":
+                            control_flags["stop_round"] = True
+                        elif command == "abort":
+                            control_flags["abort"] = True
+                        else:
+                            thread_inputs.append(raw)
                     if thread_inputs and on_progress:
                         await maybe_await(
                             on_progress(
                                 {
                                     "stage": "subagent_event",
                                     "message": f"thread_user_input: {len(thread_inputs)}개 반영",
+                                    "todo_id": task["id"],
+                                    "todo_title": task.get("title", ""),
+                                }
+                            )
+                        )
+
+                if control_flags["abort"]:
+                    results.append({"todoId": task["id"], "status": "aborted", "summary": "aborted by user"})
+                    if on_progress:
+                        await maybe_await(
+                            on_progress(
+                                {
+                                    "stage": "subagent_done",
+                                    "message": f"TODO {task['id']} aborted by user",
+                                    "todo_id": task["id"],
+                                    "todo_title": task.get("title", ""),
+                                    "status": "aborted",
+                                }
+                            )
+                        )
+                    return {
+                        "todo_results": [*prev_results, *results],
+                        "latest_todo_results": results,
+                        "subagent_outputs": [*prev_outputs, *outputs],
+                        "latest_subagent_outputs": outputs,
+                        "subagent_count": sum(1 for r in [*prev_results, *results] if r["status"] == "done"),
+                        "abort_execution": True,
+                        "done": True,
+                        "completion_reason": "aborted-by-user",
+                    }
+
+                if control_flags["skip"]:
+                    results.append({"todoId": task["id"], "status": "skipped", "summary": "skipped by user"})
+                    if on_progress:
+                        await maybe_await(
+                            on_progress(
+                                {
+                                    "stage": "subagent_done",
+                                    "message": f"TODO {task['id']} skipped by user",
+                                    "todo_id": task["id"],
+                                    "todo_title": task.get("title", ""),
+                                    "status": "skipped",
+                                }
+                            )
+                        )
+                    if control_flags["stop_round"]:
+                        return {
+                            "todo_results": [*prev_results, *results],
+                            "latest_todo_results": results,
+                            "subagent_outputs": [*prev_outputs, *outputs],
+                            "latest_subagent_outputs": outputs,
+                            "subagent_count": sum(1 for r in [*prev_results, *results] if r["status"] == "done"),
+                            "stop_after_current_round": True,
+                        }
+                    continue
+
+                if control_flags["stop_round"]:
+                    if on_progress:
+                        await maybe_await(
+                            on_progress(
+                                {
+                                    "stage": "subagent_event",
+                                    "message": "stop-round requested: this TODO will be the last in current round",
                                     "todo_id": task["id"],
                                     "todo_title": task.get("title", ""),
                                 }
@@ -429,6 +505,8 @@ class DeepAgentService:
                             }
                         )
                     )
+                if control_flags["stop_round"]:
+                    break
 
             # 서브에이전트 결과 후 오프로드
             await self.context_offload.compact_session(
@@ -448,6 +526,20 @@ class DeepAgentService:
             }
 
         async def review_and_replan(state: DeepAgentState) -> DeepAgentState:
+            if state.get("abort_execution"):
+                return {"done": True, "completion_reason": "aborted-by-user"}
+            if state.get("stop_after_current_round"):
+                if on_progress:
+                    await maybe_await(
+                        on_progress(
+                            {
+                                "stage": "planning",
+                                "message": "사용자 제어 명령으로 현재 라운드 종료 후 집계합니다.",
+                            }
+                        )
+                    )
+                return {"done": True, "completion_reason": "stop-round-by-user"}
+
             current_round = state.get("round", 1)
             if current_round >= max_rounds:
                 if on_progress:
@@ -605,6 +697,13 @@ async def maybe_await(value: Any) -> Any:
     if hasattr(value, "__await__"):
         return await value
     return value
+
+
+def parse_control_input(raw: str) -> str | None:
+    if not raw.startswith("__control__:"):
+        return None
+    command = raw.split(":", 1)[1].strip().lower()
+    return command if command in {"skip", "stop-round", "abort"} else None
 
 
 async def collect_warpgrep_filesystem_context(
