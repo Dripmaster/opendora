@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -143,6 +144,7 @@ class DeepAgentToolsService:
                     parsed.userMessage,
                 ]
             ),
+            schema=RouteDecision,
         )
         decision = RouteDecision.model_validate(raw)
         mode = "main_direct" if decision.mode == "main_direct" else "subagent_pipeline"
@@ -221,6 +223,7 @@ class DeepAgentToolsService:
                     ],
                 ]
             ),
+            schema=ContextSelectionOutput,
         )
         out = ContextSelectionOutput.model_validate(raw)
         return {
@@ -247,6 +250,7 @@ class DeepAgentToolsService:
                     ],
                 ]
             ),
+            schema=OffloadSummaryOutput,
         )
         out = OffloadSummaryOutput.model_validate(raw)
         return out.model_dump()
@@ -288,6 +292,7 @@ class DeepAgentToolsService:
         raw = await self._run_json_with_retry(
             repo_path=parsed.repoPath,
             prompt=base_prompt,
+            schema=ChannelRoutingDecision,
         )
         out = ChannelRoutingDecision.model_validate(raw)
         if out.action == "split" and (not out.newChannelName.strip() or not out.targetCategoryName.strip()):
@@ -302,6 +307,7 @@ class DeepAgentToolsService:
                     ]
                 ),
                 attempts=1,
+                schema=ChannelRoutingDecision,
             )
             out = ChannelRoutingDecision.model_validate(raw_retry)
             if out.action == "split" and (not out.newChannelName.strip() or not out.targetCategoryName.strip()):
@@ -352,6 +358,7 @@ class DeepAgentToolsService:
                     parsed.userMessage,
                 ]
             ),
+            schema=ExternalContextRoutingDecision,
         )
         out = ExternalContextRoutingDecision.model_validate(raw)
         allowed = {str(x.get("sessionKey", "")) for x in parsed.candidates}
@@ -403,6 +410,7 @@ class DeepAgentToolsService:
                     *parsed.liveConversation,
                 ]
             ),
+            schema=ReplanDecision,
         )
         decision = ReplanDecision.model_validate(raw)
         next_todos = [x.model_dump() for x in decision.nextTodos[: parsed.maxTasks]]
@@ -412,8 +420,15 @@ class DeepAgentToolsService:
             "nextTodos": next_todos,
         }
 
-    async def _run_json_with_retry(self, repo_path: str, prompt: str, attempts: int = 2) -> dict[str, Any]:
+    async def _run_json_with_retry(
+        self,
+        repo_path: str,
+        prompt: str,
+        attempts: int = 2,
+        schema: type[BaseModel] | None = None,
+    ) -> dict[str, Any]:
         last_raw = ""
+        last_error = ""
         for i in range(attempts):
             actual_prompt = prompt
             if i > 0:
@@ -430,12 +445,73 @@ class DeepAgentToolsService:
             result = await self.codex.run(repo_path=repo_path, prompt=actual_prompt)
             last_raw = result.assistant_message.strip()
             parsed = extract_json_line(last_raw)
-            if parsed is not None:
-                return parsed
-        raise ValueError("failed to parse valid JSON from model")
+            if parsed is None:
+                last_error = "parse_failed"
+                self._log_retry_issue(
+                    attempt=i + 1,
+                    attempts=attempts,
+                    reason="JSON parsing failed",
+                    raw=last_raw,
+                )
+                continue
+            if schema is not None:
+                try:
+                    schema.model_validate(parsed)
+                except ValidationError as exc:
+                    last_error = f"schema_failed:{exc.errors()[:2]}"
+                    self._log_retry_issue(
+                        attempt=i + 1,
+                        attempts=attempts,
+                        reason="Schema validation failed",
+                        raw=last_raw,
+                    )
+                    continue
+            return parsed
+        raise ValueError(
+            "failed to parse valid JSON from model"
+            f" (last_error={last_error or 'unknown'}, last_output={truncate(last_raw or '(empty)', 240)})"
+        )
+
+    def _log_retry_issue(self, attempt: int, attempts: int, reason: str, raw: str) -> None:
+        logger = getattr(self.codex, "logger", None)
+        if logger is None:
+            return
+        logger.warning(
+            "DeepAgentTools JSON attempt failed.",
+            attempt=attempt,
+            attempts=attempts,
+            reason=reason,
+            output_preview=truncate(raw or "(empty)", 400),
+        )
 
 
 def extract_json_line(text: str) -> dict[str, Any] | None:
+    # Prompt contract remains "one-line JSON", but parser accepts relaxed formats
+    # to recover from common model formatting drift.
+    try:
+        parsed_direct = json.loads(text.strip())
+        if isinstance(parsed_direct, dict):
+            return parsed_direct
+    except json.JSONDecodeError:
+        pass
+
+    for block in re.findall(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL):
+        try:
+            parsed_block = json.loads(block.strip())
+            if isinstance(parsed_block, dict):
+                return parsed_block
+        except json.JSONDecodeError:
+            continue
+
+    extracted = _extract_first_json_object(text)
+    if extracted is not None:
+        try:
+            parsed_extracted = json.loads(extracted)
+            if isinstance(parsed_extracted, dict):
+                return parsed_extracted
+        except json.JSONDecodeError:
+            pass
+
     candidates = [x.strip() for x in text.splitlines() if x.strip()]
     for line in candidates:
         if not (line.startswith("{") and line.endswith("}")):
@@ -446,6 +522,36 @@ def extract_json_line(text: str) -> dict[str, Any] | None:
             continue
         if isinstance(parsed, dict):
             return parsed
+    return None
+
+
+def _extract_first_json_object(text: str) -> str | None:
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        in_string = False
+        escaped = False
+        for idx in range(start, len(text)):
+            char = text[idx]
+            if in_string:
+                if escaped:
+                    escaped = False
+                    continue
+                if char == "\\":
+                    escaped = True
+                    continue
+                if char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : idx + 1]
+        start = text.find("{", start + 1)
     return None
 
 
