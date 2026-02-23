@@ -43,7 +43,7 @@ async def test_deep_agent_main_direct(tmp_path):
     context = ContextOffloadService(
         ContextOffloadOptions(True, str(tmp_path / "ctx"), 12000, 10, 4)
     )
-    agent = DeepAgentService(codex=codex, context_offload=context, tools=tools, options=DeepAgentOptions(True, 3))  # type: ignore[arg-type]
+    agent = DeepAgentService(codex=codex, context_offload=context, tools=tools, options=DeepAgentOptions(True, 3, 3))  # type: ignore[arg-type]
 
     result = await agent.execute("c:u", "hello", ".")
     assert result.mode == "main_direct"
@@ -66,7 +66,7 @@ async def test_deep_agent_subagent_blocked_and_aggregate(tmp_path):
     context = ContextOffloadService(
         ContextOffloadOptions(True, str(tmp_path / "ctx"), 12000, 10, 4)
     )
-    agent = DeepAgentService(codex=codex, context_offload=context, tools=tools, options=DeepAgentOptions(True, 3))  # type: ignore[arg-type]
+    agent = DeepAgentService(codex=codex, context_offload=context, tools=tools, options=DeepAgentOptions(True, 3, 3))  # type: ignore[arg-type]
 
     result = await agent.execute("c:u", "build this", ".")
     assert result.mode == "subagent_pipeline"
@@ -93,12 +93,38 @@ async def test_deep_agent_replans_and_runs_additional_round(tmp_path):
     context = ContextOffloadService(
         ContextOffloadOptions(True, str(tmp_path / "ctx"), 12000, 10, 4)
     )
-    agent = DeepAgentService(codex=codex, context_offload=context, tools=tools, options=DeepAgentOptions(True, 3))  # type: ignore[arg-type]
+    agent = DeepAgentService(codex=codex, context_offload=context, tools=tools, options=DeepAgentOptions(True, 3, 3))  # type: ignore[arg-type]
 
     result = await agent.execute("c:u", "build this", ".")
     assert result.mode == "subagent_pipeline"
     assert result.subagent_count == 2
     assert result.final_response == "final-aggregate"
+
+
+async def test_deep_agent_stops_when_max_rounds_reached(tmp_path):
+    codex = FakeCodex(
+        [
+            '{"offloadIds":[],"liveMessageIds":[]}',
+            '{"mode":"subagent_pipeline","reason":"complex"}',
+            '{"todos":[{"id":"T1","title":"first","instructions":"do-1","priority":"high","dependsOn":[],"doneDefinition":"done"}]}',
+            '{"offloadIds":[],"liveMessageIds":[]}',
+            "round1-output",
+            "final-aggregate",
+        ]
+    )
+    tools = DeepAgentToolsService(codex=codex)  # type: ignore[arg-type]
+    context = ContextOffloadService(
+        ContextOffloadOptions(True, str(tmp_path / "ctx"), 12000, 10, 4)
+    )
+    agent = DeepAgentService(codex=codex, context_offload=context, tools=tools, options=DeepAgentOptions(True, 3, 1))  # type: ignore[arg-type]
+
+    result = await agent.execute("c:u", "build this", ".")
+
+    assert result.mode == "subagent_pipeline"
+    assert result.final_response == "final-aggregate"
+    aggregate_prompt = codex.prompts[-1]
+    assert "[Completion Reason]" in aggregate_prompt
+    assert "max-rounds-reached:1" in aggregate_prompt
 
 
 async def test_deep_agent_filesystem_tool_node_injects_warpgrep_context(tmp_path):
@@ -118,7 +144,7 @@ async def test_deep_agent_filesystem_tool_node_injects_warpgrep_context(tmp_path
     context = ContextOffloadService(
         ContextOffloadOptions(True, str(tmp_path / "ctx"), 12000, 10, 4)
     )
-    agent = DeepAgentService(codex=codex, context_offload=context, tools=tools, options=DeepAgentOptions(True, 3))  # type: ignore[arg-type]
+    agent = DeepAgentService(codex=codex, context_offload=context, tools=tools, options=DeepAgentOptions(True, 3, 3))  # type: ignore[arg-type]
 
     result = await agent.execute("c:u", "warpgrep pattern 파일 찾아줘", str(tmp_path))
 

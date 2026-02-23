@@ -43,6 +43,7 @@ class DeepAgentOptions:
     max_subagents: int
     warpgrep_max_files: int = 200
     warpgrep_max_depth: int = 4
+    max_rounds: int = 3
 
 
 @dataclass(slots=True)
@@ -73,7 +74,7 @@ class DeepAgentService:
         on_progress: ProgressHandler | None = None,
         todo_input_provider: TodoInputProvider | None = None,
     ) -> DeepAgentResult:
-        max_rounds = 3
+        max_rounds = self.options.max_rounds
         graph = StateGraph(DeepAgentState)
 
         async def save_user_request(state: DeepAgentState) -> DeepAgentState:

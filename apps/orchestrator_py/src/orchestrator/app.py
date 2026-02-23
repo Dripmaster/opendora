@@ -42,6 +42,7 @@ class OrchestratorApp:
                 max_subagents=self.env.DEEP_AGENT_MAX_SUBAGENTS,
                 warpgrep_max_files=self.env.WARPGREP_MAX_FILES,
                 warpgrep_max_depth=self.env.WARPGREP_MAX_DEPTH,
+                max_rounds=self.env.DEEP_AGENT_MAX_ROUNDS,
             ),
         )
         self.discord = DiscordGateway(self.env, self.deep_agent, self.logger)
