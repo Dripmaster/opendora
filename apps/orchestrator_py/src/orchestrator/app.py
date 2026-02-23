@@ -21,6 +21,8 @@ class OrchestratorApp:
                 timeout_ms=self.env.CODEX_TIMEOUT_MS,
                 model=self.env.CODEX_MODEL,
                 sandbox=self.env.CODEX_SANDBOX,
+                retry_count=self.env.CODEX_RETRY_COUNT,
+                retry_backoff_ms=self.env.CODEX_RETRY_BACKOFF_MS,
             ),
         )
         self.context_offload = ContextOffloadService(

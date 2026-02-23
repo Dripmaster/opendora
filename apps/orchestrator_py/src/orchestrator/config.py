@@ -43,6 +43,8 @@ class AppEnv(BaseSettings):
     CODEX_TIMEOUT_MS: int = Field(default=900000, gt=0)
     CODEX_MODEL: str | None = None
     CODEX_SANDBOX: Literal["read-only", "workspace-write", "danger-full-access"] = "workspace-write"
+    CODEX_RETRY_COUNT: int = Field(default=2, ge=0)
+    CODEX_RETRY_BACKOFF_MS: int = Field(default=250, ge=0)
 
 
 def read_env() -> AppEnv:
