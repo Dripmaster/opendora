@@ -2,8 +2,14 @@ from __future__ import annotations
 
 from orchestrator.adapters.discord_gateway import DiscordGateway
 from orchestrator.config import read_env
-from orchestrator.services.codex_cli_runtime import CodexCliRuntimeOptions, CodexCliRuntimeService
-from orchestrator.services.context_offload import ContextOffloadOptions, ContextOffloadService
+from orchestrator.services.codex_cli_runtime import (
+    CodexCliRuntimeOptions,
+    CodexCliRuntimeService,
+)
+from orchestrator.services.context_offload import (
+    ContextOffloadOptions,
+    ContextOffloadService,
+)
 from orchestrator.services.deep_agent import DeepAgentOptions, DeepAgentService
 from orchestrator.services.deep_agent_tools import DeepAgentToolsService
 from orchestrator.services.logger import create_logger
@@ -20,6 +26,7 @@ class OrchestratorApp:
                 binary=self.env.CODEX_BIN,
                 timeout_ms=self.env.CODEX_TIMEOUT_MS,
                 model=self.env.CODEX_MODEL,
+                model_candidates=_parse_csv_values(self.env.CODEX_MODEL_CANDIDATES),
                 sandbox=self.env.CODEX_SANDBOX,
                 retry_count=self.env.CODEX_RETRY_COUNT,
                 retry_backoff_ms=self.env.CODEX_RETRY_BACKOFF_MS,
@@ -32,9 +39,14 @@ class OrchestratorApp:
                 max_estimated_tokens=self.env.CONTEXT_MAX_ESTIMATED_TOKENS,
                 keep_recent_messages=self.env.CONTEXT_KEEP_RECENT_MESSAGES,
                 retrieve_top_k=self.env.CONTEXT_RETRIEVE_TOP_K,
+                session_cache_size=self.env.CONTEXT_SESSION_CACHE_SIZE,
             )
         )
-        self.deep_agent_tools = DeepAgentToolsService(self.codex)
+        self.deep_agent_tools = DeepAgentToolsService(
+            self.codex,
+            mcp_enabled=self.env.MCP_ENABLED,
+            mcp_server_urls=_parse_csv_values(self.env.MCP_SERVER_URLS),
+        )
         self.deep_agent = DeepAgentService(
             codex=self.codex,
             context_offload=self.context_offload,
@@ -56,3 +68,7 @@ class OrchestratorApp:
     async def stop(self) -> None:
         self.logger.info("Stopping remote Codex runner.")
         await self.discord.stop()
+
+
+def _parse_csv_values(raw: str) -> list[str]:
+    return [value.strip() for value in raw.split(",") if value.strip()]

@@ -4,8 +4,11 @@ import asyncio
 import inspect
 import json
 import os
+import time
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable, TypeAlias, cast
+
+EventHandler: TypeAlias = Callable[[dict[str, Any]], Any]
 
 
 @dataclass(slots=True)
@@ -14,6 +17,7 @@ class CodexCliRuntimeOptions:
     timeout_ms: int
     sandbox: str
     model: str | None = None
+    model_candidates: list[str] | None = None
     retry_count: int = 0
     retry_backoff_ms: int = 250
 
@@ -21,6 +25,7 @@ class CodexCliRuntimeOptions:
 @dataclass(slots=True)
 class _RetryAttempt:
     attempt: int
+    model: str | None
     reason: str
     stderr_summary: str
 
@@ -49,6 +54,8 @@ class CodexRunResult:
     usage: Usage
     thread_id: str | None
     events: list[dict[str, Any]]
+    duration_ms: int
+    prompt_chars: int
 
 
 class CodexCliRuntimeService:
@@ -56,14 +63,39 @@ class CodexCliRuntimeService:
         self.logger = logger
         self.options = options
 
-    async def run(self, repo_path: str, prompt: str, sandbox: str | None = None, timeout_ms: int | None = None) -> CodexRunResult:
+    async def run(
+        self,
+        repo_path: str,
+        prompt: str,
+        sandbox: str | None = None,
+        timeout_ms: int | None = None,
+    ) -> CodexRunResult:
         return await self._run_with_retries(
-            operation=lambda: self._run_once(repo_path=repo_path, prompt=prompt, sandbox=sandbox, timeout_ms=timeout_ms),
+            operation=lambda model: self._run_once(
+                repo_path=repo_path,
+                prompt=prompt,
+                sandbox=sandbox,
+                timeout_ms=timeout_ms,
+                model=model,
+            ),
             operation_name="codex run",
         )
 
-    async def _run_once(self, repo_path: str, prompt: str, sandbox: str | None = None, timeout_ms: int | None = None) -> CodexRunResult:
-        args = self._build_args(repo_path=repo_path, prompt=prompt, sandbox=sandbox)
+    async def _run_once(
+        self,
+        repo_path: str,
+        prompt: str,
+        sandbox: str | None = None,
+        timeout_ms: int | None = None,
+        model: str | None = None,
+    ) -> CodexRunResult:
+        started = time.perf_counter()
+        args = self._build_args(
+            repo_path=repo_path,
+            prompt=prompt,
+            sandbox=sandbox,
+            model=model,
+        )
         proc = await asyncio.create_subprocess_exec(
             self.options.binary,
             *args,
@@ -72,23 +104,46 @@ class CodexCliRuntimeService:
             env=os.environ.copy(),
         )
         try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=(timeout_ms or self.options.timeout_ms) / 1000)
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=(timeout_ms or self.options.timeout_ms) / 1000,
+            )
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
-            raise _RetryableCodexError("codex execution timed out", stderr_summary="timeout")
+            raise _RetryableCodexError(
+                "codex execution timed out", stderr_summary="timeout"
+            )
 
         stderr_text = (stderr or b"").decode("utf-8", errors="ignore").strip()
         if stderr_text:
             self.logger.warning("Codex CLI wrote to stderr.", stderr=stderr_text[:2000])
 
         if proc.returncode != 0:
-            self._raise_for_exit_failure(proc.returncode, stderr_text)
+            returncode = proc.returncode
+            if returncode is None:
+                raise _RetryableCodexError(
+                    "codex process ended without return code",
+                    stderr_summary=(stderr_text or "missing returncode")[:300],
+                )
+            self._raise_for_exit_failure(returncode, stderr_text)
 
-        parsed = parse_codex_json_events((stdout or b"").decode("utf-8", errors="ignore"))
+        parsed = parse_codex_json_events(
+            (stdout or b"").decode("utf-8", errors="ignore")
+        )
         if not parsed.events:
-            raise _RetryableCodexError("failed to parse codex json events", stderr_summary=(stderr_text or "no json events")[:300])
-        return parsed
+            raise _RetryableCodexError(
+                "failed to parse codex json events",
+                stderr_summary=(stderr_text or "no json events")[:300],
+            )
+        return CodexRunResult(
+            assistant_message=parsed.assistant_message,
+            usage=parsed.usage,
+            thread_id=parsed.thread_id,
+            events=parsed.events,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            prompt_chars=len(prompt),
+        )
 
     async def run_streaming(
         self,
@@ -96,17 +151,19 @@ class CodexCliRuntimeService:
         prompt: str,
         sandbox: str | None = None,
         timeout_ms: int | None = None,
-        on_event: Callable[[dict[str, Any]], None] | None = None,
+        on_event: EventHandler | None = None,
     ) -> CodexRunResult:
         return await self._run_with_retries(
-            operation=lambda: self._run_streaming_once(
+            operation=lambda model: self._run_streaming_once(
                 repo_path=repo_path,
                 prompt=prompt,
                 sandbox=sandbox,
                 timeout_ms=timeout_ms,
                 on_event=on_event,
+                model=model,
             ),
             operation_name="codex run_streaming",
+            on_retry_event=on_event,
         )
 
     async def _run_streaming_once(
@@ -115,9 +172,16 @@ class CodexCliRuntimeService:
         prompt: str,
         sandbox: str | None = None,
         timeout_ms: int | None = None,
-        on_event: Callable[[dict[str, Any]], None] | None = None,
+        on_event: EventHandler | None = None,
+        model: str | None = None,
     ) -> CodexRunResult:
-        args = self._build_args(repo_path=repo_path, prompt=prompt, sandbox=sandbox)
+        started = time.perf_counter()
+        args = self._build_args(
+            repo_path=repo_path,
+            prompt=prompt,
+            sandbox=sandbox,
+            model=model,
+        )
         proc = await asyncio.create_subprocess_exec(
             self.options.binary,
             *args,
@@ -143,24 +207,38 @@ class CodexCliRuntimeService:
                 if not (text.startswith("{") and text.endswith("}")):
                     continue
                 try:
-                    parsed = json.loads(text)
+                    parsed_raw = json.loads(text)
                 except json.JSONDecodeError:
                     continue
-                if not isinstance(parsed, dict):
+                if not isinstance(parsed_raw, dict):
                     continue
+                parsed: dict[str, Any] = parsed_raw
                 events.append(parsed)
                 if on_event:
                     maybe_awaited = on_event(parsed)
                     if inspect.isawaitable(maybe_awaited):
-                        await maybe_awaited
-                if parsed.get("type") == "thread.started" and isinstance(parsed.get("thread_id"), str):
-                    thread_id = parsed["thread_id"]
+                        await cast(Awaitable[Any], maybe_awaited)
+                if parsed.get("type") == "thread.started" and isinstance(
+                    parsed.get("thread_id"), str
+                ):
+                    thread_id_value = parsed.get("thread_id")
+                    if isinstance(thread_id_value, str):
+                        thread_id = thread_id_value
                 if parsed.get("type") == "item.completed":
-                    item = parsed.get("item") if isinstance(parsed.get("item"), dict) else {}
-                    if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
-                        assistant_message = item["text"]
+                    raw_item = parsed.get("item")
+                    if (
+                        isinstance(raw_item, dict)
+                        and raw_item.get("type") == "agent_message"
+                        and isinstance(raw_item.get("text"), str)
+                    ):
+                        text_value = raw_item.get("text")
+                        if isinstance(text_value, str):
+                            assistant_message = text_value
                 if parsed.get("type") == "turn.completed":
-                    raw_usage = parsed.get("usage") if isinstance(parsed.get("usage"), dict) else {}
+                    usage_value = parsed.get("usage")
+                    raw_usage: dict[str, Any] = {}
+                    if isinstance(usage_value, dict):
+                        raw_usage = usage_value
                     inp = int(raw_usage.get("input_tokens", 0) or 0)
                     out = int(raw_usage.get("output_tokens", 0) or 0)
                     total = int(raw_usage.get("total_tokens", inp + out) or (inp + out))
@@ -173,46 +251,87 @@ class CodexCliRuntimeService:
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
-            raise _RetryableCodexError("codex streaming execution timed out", stderr_summary="timeout")
+            raise _RetryableCodexError(
+                "codex streaming execution timed out", stderr_summary="timeout"
+            )
 
         stderr_text = (stderr or b"").decode("utf-8", errors="ignore").strip()
         if stderr_text:
             self.logger.warning("Codex CLI wrote to stderr.", stderr=stderr_text[:2000])
         if proc.returncode != 0:
-            self._raise_for_exit_failure(proc.returncode, stderr_text)
+            returncode = proc.returncode
+            if returncode is None:
+                raise _RetryableCodexError(
+                    "codex process ended without return code",
+                    stderr_summary=(stderr_text or "missing returncode")[:300],
+                )
+            self._raise_for_exit_failure(returncode, stderr_text)
         if not events:
-            raise _RetryableCodexError("failed to parse codex json events", stderr_summary=(stderr_text or "no json events")[:300])
+            raise _RetryableCodexError(
+                "failed to parse codex json events",
+                stderr_summary=(stderr_text or "no json events")[:300],
+            )
 
         return CodexRunResult(
             assistant_message=assistant_message,
             usage=usage,
             thread_id=thread_id,
             events=events,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            prompt_chars=len(prompt),
         )
 
-    async def _run_with_retries(self, operation: Callable[[], Any], operation_name: str) -> CodexRunResult:
+    async def _run_with_retries(
+        self,
+        operation: Callable[[str | None], Awaitable[CodexRunResult]],
+        operation_name: str,
+        on_retry_event: EventHandler | None = None,
+    ) -> CodexRunResult:
         max_attempts = max(1, self.options.retry_count + 1)
         attempts: list[_RetryAttempt] = []
         for attempt in range(1, max_attempts + 1):
+            model = self._model_for_attempt(attempt)
             try:
-                return await operation()
+                return await operation(model)
             except _NonRetryableCodexError as exc:
-                raise RuntimeError(f"{operation_name} failed with non-retryable error: {exc}") from exc
+                raise RuntimeError(
+                    f"{operation_name} failed with non-retryable error: {exc}"
+                ) from exc
             except _RetryableCodexError as exc:
                 summary = exc.stderr_summary or "unknown"
-                attempts.append(_RetryAttempt(attempt=attempt, reason=exc.reason, stderr_summary=summary))
+                attempts.append(
+                    _RetryAttempt(
+                        attempt=attempt,
+                        model=model,
+                        reason=exc.reason,
+                        stderr_summary=summary,
+                    )
+                )
                 if attempt >= max_attempts:
-                    last = attempts[-1]
+                    chain = [
+                        {
+                            "attempt": item.attempt,
+                            "model": item.model,
+                            "reason": item.reason,
+                            "stderr_summary": item.stderr_summary,
+                        }
+                        for item in attempts
+                    ]
                     raise RuntimeError(
                         f"{operation_name} failed after {len(attempts)} attempt(s); "
-                        f"last_reason={last.reason}; last_stderr={last.stderr_summary}"
+                        f"attempt_chain={json.dumps(chain, ensure_ascii=True)}"
                     ) from exc
-                backoff_sec = (self.options.retry_backoff_ms * (2 ** (attempt - 1))) / 1000
-                self.logger.warning(
-                    "Codex CLI transient failure. Retrying.",
+                backoff_sec = (
+                    self.options.retry_backoff_ms * (2 ** (attempt - 1))
+                ) / 1000
+                await self._emit_retry_attempt(
+                    operation_name=operation_name,
                     attempt=attempt,
                     max_attempts=max_attempts,
+                    model=model,
                     reason=exc.reason,
+                    stderr_summary=summary,
+                    on_retry_event=on_retry_event,
                 )
                 await asyncio.sleep(backoff_sec)
 
@@ -223,19 +342,91 @@ class CodexCliRuntimeService:
         lower_excerpt = err_excerpt.lower()
         if returncode in {2, 126, 127} or any(
             marker in lower_excerpt
-            for marker in ("unknown option", "invalid option", "invalid argument", "permission denied", "access denied")
+            for marker in (
+                "unknown option",
+                "invalid option",
+                "invalid argument",
+                "permission denied",
+                "access denied",
+            )
         ):
-            raise _NonRetryableCodexError(f"codex exited with code {returncode}: {err_excerpt}")
+            raise _NonRetryableCodexError(
+                f"codex exited with code {returncode}: {err_excerpt}"
+            )
         if returncode in {1, 124, 137}:
-            raise _RetryableCodexError(f"codex exited with retryable code {returncode}", stderr_summary=err_excerpt[:300])
-        raise _NonRetryableCodexError(f"codex exited with code {returncode}: {err_excerpt}")
+            raise _RetryableCodexError(
+                f"codex exited with retryable code {returncode}",
+                stderr_summary=err_excerpt[:300],
+            )
+        raise _NonRetryableCodexError(
+            f"codex exited with code {returncode}: {err_excerpt}"
+        )
 
-    def _build_args(self, repo_path: str, prompt: str, sandbox: str | None) -> list[str]:
-        args = ["exec", "--json", "-C", repo_path, "--sandbox", sandbox or self.options.sandbox]
-        if self.options.model:
-            args += ["--model", self.options.model]
+    def _build_args(
+        self,
+        repo_path: str,
+        prompt: str,
+        sandbox: str | None,
+        model: str | None,
+    ) -> list[str]:
+        args = [
+            "exec",
+            "--json",
+            "-C",
+            repo_path,
+            "--sandbox",
+            sandbox or self.options.sandbox,
+        ]
+        if model:
+            args += ["--model", model]
         args.append(prompt)
         return args
+
+    def _model_for_attempt(self, attempt: int) -> str | None:
+        model_chain: list[str] = []
+        if self.options.model:
+            model_chain.append(self.options.model)
+        for candidate in self.options.model_candidates or []:
+            normalized = candidate.strip()
+            if normalized and normalized not in model_chain:
+                model_chain.append(normalized)
+        if not model_chain:
+            return None
+        index = min(max(0, attempt - 1), len(model_chain) - 1)
+        return model_chain[index]
+
+    async def _emit_retry_attempt(
+        self,
+        operation_name: str,
+        attempt: int,
+        max_attempts: int,
+        model: str | None,
+        reason: str,
+        stderr_summary: str,
+        on_retry_event: EventHandler | None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "type": "codex.retry.attempt",
+            "operation": operation_name,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "model": model,
+            "reason": reason,
+            "stderr_summary": stderr_summary,
+        }
+        if on_retry_event:
+            maybe_awaited = on_retry_event(payload)
+            if inspect.isawaitable(maybe_awaited):
+                await cast(Awaitable[Any], maybe_awaited)
+            return
+        self.logger.warning(
+            "Codex CLI transient failure. Retrying.",
+            attempt=attempt,
+            max_attempts=max_attempts,
+            model=model,
+            reason=reason,
+            stderr_summary=stderr_summary,
+        )
 
 
 def parse_codex_json_events(stdout: str) -> CodexRunResult:
@@ -249,20 +440,34 @@ def parse_codex_json_events(stdout: str) -> CodexRunResult:
         if not (line.startswith("{") and line.endswith("}")):
             continue
         try:
-            parsed = json.loads(line)
+            parsed_raw = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not isinstance(parsed, dict):
+        if not isinstance(parsed_raw, dict):
             continue
+        parsed: dict[str, Any] = parsed_raw
         events.append(parsed)
-        if parsed.get("type") == "thread.started" and isinstance(parsed.get("thread_id"), str):
-            thread_id = parsed["thread_id"]
+        if parsed.get("type") == "thread.started" and isinstance(
+            parsed.get("thread_id"), str
+        ):
+            thread_id_value = parsed.get("thread_id")
+            if isinstance(thread_id_value, str):
+                thread_id = thread_id_value
         if parsed.get("type") == "item.completed":
-            item = parsed.get("item") if isinstance(parsed.get("item"), dict) else {}
-            if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
-                assistant_message = item["text"]
+            raw_item = parsed.get("item")
+            if (
+                isinstance(raw_item, dict)
+                and raw_item.get("type") == "agent_message"
+                and isinstance(raw_item.get("text"), str)
+            ):
+                text_value = raw_item.get("text")
+                if isinstance(text_value, str):
+                    assistant_message = text_value
         if parsed.get("type") == "turn.completed":
-            raw_usage = parsed.get("usage") if isinstance(parsed.get("usage"), dict) else {}
+            usage_value = parsed.get("usage")
+            raw_usage: dict[str, Any] = {}
+            if isinstance(usage_value, dict):
+                raw_usage = usage_value
             inp = int(raw_usage.get("input_tokens", 0) or 0)
             out = int(raw_usage.get("output_tokens", 0) or 0)
             total = int(raw_usage.get("total_tokens", inp + out) or (inp + out))
@@ -273,4 +478,6 @@ def parse_codex_json_events(stdout: str) -> CodexRunResult:
         usage=usage,
         thread_id=thread_id,
         events=events,
+        duration_ms=0,
+        prompt_chars=0,
     )

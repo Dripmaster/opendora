@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import asyncio
-import os
+import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, TypedDict
+from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
 from .codex_cli_runtime import CodexCliRuntimeService
 from .context_offload import ContextOffloadService
 from .deep_agent_tools import DeepAgentToolsService
+from .warpgrep_cache import get_warpgrep_inventory
 
 
 class DeepAgentState(TypedDict, total=False):
@@ -79,18 +81,40 @@ class DeepAgentService:
         max_rounds = self.options.max_rounds
         graph = StateGraph(DeepAgentState)
 
+        async def emit_timing(
+            stage: str,
+            started_at: float,
+            prompt_chars: int,
+            usage_total_tokens: int | None = None,
+            extra: dict[str, Any] | None = None,
+        ) -> None:
+            if not on_progress:
+                return
+            payload: dict[str, Any] = {
+                "stage": stage,
+                "duration_ms": int((time.perf_counter() - started_at) * 1000),
+                "prompt_chars": max(0, int(prompt_chars)),
+            }
+            if usage_total_tokens is not None and usage_total_tokens > 0:
+                payload["usage_total_tokens"] = int(usage_total_tokens)
+            if extra:
+                payload.update(extra)
+            await maybe_await(on_progress(payload))
+
         async def save_user_request(state: DeepAgentState) -> DeepAgentState:
             """유저 요청 저장 시 오프로드."""
             await self.context_offload.persist_user_request(
                 session_key=state["session_key"],
                 user_message=state["user_message"],
                 summarize_offload=lambda offload: self.tools.invoke_summarize_offload(
-                    {"repoPath": state["repo_path"], "messages": offload["messages"]}
+                    {"repoPath": state["repo_path"], "messages": offload["messages"]},
+                    on_metrics=on_progress,
                 ),
             )
             return {}
 
         async def prepare_context(state: DeepAgentState) -> DeepAgentState:
+            capsule_started = time.perf_counter()
             capsule = await self.context_offload.build_capsule(
                 session_key=state["session_key"],
                 query=state["user_message"],
@@ -99,15 +123,28 @@ class DeepAgentService:
                         "repoPath": state["repo_path"],
                         "taskInstructions": state["user_message"],
                         **x,
-                    }
+                    },
+                    on_metrics=on_progress,
                 ),
+            )
+            await emit_timing(
+                stage="context_capsule_build",
+                started_at=capsule_started,
+                prompt_chars=len(state["user_message"]),
             )
             merged_offloads = list(capsule.offloaded_context)
             external_count = 0
+            candidate_scan_started = time.perf_counter()
             candidates = self.context_offload.list_related_session_candidates(
                 current_session_key=state["session_key"],
                 query=state["user_message"],
                 limit=12,
+            )
+            await emit_timing(
+                stage="context_candidate_scan",
+                started_at=candidate_scan_started,
+                prompt_chars=len(state["user_message"]),
+                extra={"candidate_count": len(candidates)},
             )
             if candidates:
                 external_decision = await self.tools.invoke_external_context_routing(
@@ -127,9 +164,14 @@ class DeepAgentService:
                             for x in candidates
                         ],
                         "maxSelect": 3,
-                    }
+                    },
+                    on_metrics=on_progress,
                 )
-                selected = external_decision.get("selectedSessionKeys", []) if external_decision.get("useExternalContext") else []
+                selected = (
+                    external_decision.get("selectedSessionKeys", [])
+                    if external_decision.get("useExternalContext")
+                    else []
+                )
                 for session_key in selected:
                     ext_capsule = self.context_offload.build_capsule_from_session(
                         session_key=session_key,
@@ -172,22 +214,52 @@ class DeepAgentService:
                     "userMessage": state["user_message"],
                     "offloadedContext": state.get("offloaded_context", []),
                     "liveConversation": state.get("live_conversation", []),
-                }
+                },
+                on_metrics=on_progress,
             )
-            return {"mode": route_result["mode"], "route_reason": route_result["reason"]}
+            return {
+                "mode": route_result["mode"],
+                "route_reason": route_result["reason"],
+            }
 
         async def main_direct(state: DeepAgentState) -> DeepAgentState:
             if on_progress:
-                await maybe_await(on_progress({"stage": "main_direct", "message": f"모델 라우팅: main_direct ({state.get('route_reason', '')})"}))
+                await maybe_await(
+                    on_progress(
+                        {
+                            "stage": "main_direct",
+                            "message": f"모델 라우팅: main_direct ({state.get('route_reason', '')})",
+                        }
+                    )
+                )
+            prompt = build_main_direct_prompt(state)
+            started = time.perf_counter()
             result = await self.codex.run(
                 repo_path=state["repo_path"],
-                prompt=build_main_direct_prompt(state),
+                prompt=prompt,
             )
-            return {"final_response": result.assistant_message.strip() or "(empty response)", "subagent_count": 0}
+            await emit_timing(
+                stage="main_direct",
+                started_at=started,
+                prompt_chars=len(prompt),
+                usage_total_tokens=int(getattr(result.usage, "total", 0) or 0),
+            )
+            return {
+                "final_response": result.assistant_message.strip()
+                or "(empty response)",
+                "subagent_count": 0,
+            }
 
         async def plan(state: DeepAgentState) -> DeepAgentState:
             if on_progress:
-                await maybe_await(on_progress({"stage": "planning", "message": f"모델 라우팅: subagent_pipeline ({state.get('route_reason', '')})"}))
+                await maybe_await(
+                    on_progress(
+                        {
+                            "stage": "planning",
+                            "message": f"모델 라우팅: subagent_pipeline ({state.get('route_reason', '')})",
+                        }
+                    )
+                )
             tasks = await self.tools.invoke_plan(
                 {
                     "repoPath": state["repo_path"],
@@ -198,7 +270,8 @@ class DeepAgentService:
                     ],
                     "liveConversation": state.get("live_conversation", []),
                     "maxTasks": self.options.max_subagents,
-                }
+                },
+                on_metrics=on_progress,
             )
             if on_progress:
                 await maybe_await(
@@ -209,7 +282,12 @@ class DeepAgentService:
                         }
                     )
                 )
-            return {"todo_list": tasks, "todo_results": [], "subagent_outputs": [], "round": 1}
+            return {
+                "todo_list": tasks,
+                "todo_results": [],
+                "subagent_outputs": [],
+                "round": 1,
+            }
 
         async def validate_todo_plan_node(state: DeepAgentState) -> DeepAgentState:
             tasks = state.get("todo_list", [])
@@ -227,6 +305,12 @@ class DeepAgentService:
                         }
                     )
                 )
+
+            if validation_errors and all(
+                error.startswith("undefined dependsOn references:")
+                for error in validation_errors
+            ):
+                return {"done": False}
 
             current_round = state.get("round", 1)
             if current_round >= max_rounds:
@@ -248,7 +332,8 @@ class DeepAgentService:
                     "currentRound": current_round,
                     "maxRounds": max_rounds,
                     "maxTasks": self.options.max_subagents,
-                }
+                },
+                on_metrics=on_progress,
             )
             if decision.get("done"):
                 return {
@@ -291,7 +376,8 @@ class DeepAgentService:
             await self.context_offload.compact_session(
                 session_key=state["session_key"],
                 summarize_offload=lambda offload: self.tools.invoke_summarize_offload(
-                    {"repoPath": state["repo_path"], "messages": offload["messages"]}
+                    {"repoPath": state["repo_path"], "messages": offload["messages"]},
+                    on_metrics=on_progress,
                 ),
             )
             tasks = state.get("todo_list", [])
@@ -303,11 +389,21 @@ class DeepAgentService:
                 unmet = [
                     dep
                     for dep in task.get("dependsOn", [])
-                    if not any(r["todoId"] == dep and r["status"] == "done" for r in [*prev_results, *results])
+                    if not any(
+                        r["todoId"] == dep and r["status"] == "done"
+                        for r in [*prev_results, *results]
+                    )
                 ]
                 if unmet:
                     blocker = f"의존 TODO 미완료: {', '.join(unmet)}"
-                    results.append({"todoId": task["id"], "status": "blocked", "summary": blocker, "blocker": blocker})
+                    results.append(
+                        {
+                            "todoId": task["id"],
+                            "status": "blocked",
+                            "summary": blocker,
+                            "blocker": blocker,
+                        }
+                    )
                     if on_progress:
                         await maybe_await(
                             on_progress(
@@ -334,29 +430,6 @@ class DeepAgentService:
                         )
                     )
 
-                selected = await self.tools.invoke_select_context(
-                    {
-                        "repoPath": state["repo_path"],
-                        "taskInstructions": task["instructions"],
-                        "query": task["instructions"],
-                        "offloads": [
-                            {"id": f"offload-{idx}", "summary": summary, "createdAt": ""}
-                            for idx, summary in enumerate(state.get("offloaded_context", []))
-                        ],
-                        "liveMessages": [
-                            {
-                                "id": f"live-{idx}",
-                                "role": "assistant" if line.startswith("[assistant]") else "user",
-                                "content": line,
-                                "createdAt": "",
-                            }
-                            for idx, line in enumerate(state.get("live_conversation", []))
-                        ],
-                        "limits": {"offloads": 2, "liveMessages": 6},
-                    }
-                )
-                relevant_offloads = map_selected(state.get("offloaded_context", []), selected["offloadIds"], "offload")
-                relevant_live = map_selected(state.get("live_conversation", []), selected["liveMessageIds"], "live")
                 thread_inputs: list[str] = []
                 control_flags = {"skip": False, "stop_round": False, "abort": False}
                 if todo_input_provider:
@@ -385,7 +458,13 @@ class DeepAgentService:
                         )
 
                 if control_flags["abort"]:
-                    results.append({"todoId": task["id"], "status": "aborted", "summary": "aborted by user"})
+                    results.append(
+                        {
+                            "todoId": task["id"],
+                            "status": "aborted",
+                            "summary": "aborted by user",
+                        }
+                    )
                     if on_progress:
                         await maybe_await(
                             on_progress(
@@ -403,14 +482,24 @@ class DeepAgentService:
                         "latest_todo_results": results,
                         "subagent_outputs": [*prev_outputs, *outputs],
                         "latest_subagent_outputs": outputs,
-                        "subagent_count": sum(1 for r in [*prev_results, *results] if r["status"] == "done"),
+                        "subagent_count": sum(
+                            1
+                            for r in [*prev_results, *results]
+                            if r["status"] == "done"
+                        ),
                         "abort_execution": True,
                         "done": True,
                         "completion_reason": "aborted-by-user",
                     }
 
                 if control_flags["skip"]:
-                    results.append({"todoId": task["id"], "status": "skipped", "summary": "skipped by user"})
+                    results.append(
+                        {
+                            "todoId": task["id"],
+                            "status": "skipped",
+                            "summary": "skipped by user",
+                        }
+                    )
                     if on_progress:
                         await maybe_await(
                             on_progress(
@@ -429,10 +518,57 @@ class DeepAgentService:
                             "latest_todo_results": results,
                             "subagent_outputs": [*prev_outputs, *outputs],
                             "latest_subagent_outputs": outputs,
-                            "subagent_count": sum(1 for r in [*prev_results, *results] if r["status"] == "done"),
+                            "subagent_count": sum(
+                                1
+                                for r in [*prev_results, *results]
+                                if r["status"] == "done"
+                            ),
                             "stop_after_current_round": True,
                         }
                     continue
+
+                selected = await self.tools.invoke_select_context(
+                    {
+                        "repoPath": state["repo_path"],
+                        "taskInstructions": task["instructions"],
+                        "query": task["instructions"],
+                        "offloads": [
+                            {
+                                "id": f"offload-{idx}",
+                                "summary": summary,
+                                "createdAt": "",
+                            }
+                            for idx, summary in enumerate(
+                                state.get("offloaded_context", [])
+                            )
+                        ],
+                        "liveMessages": [
+                            {
+                                "id": f"live-{idx}",
+                                "role": "assistant"
+                                if line.startswith("[assistant]")
+                                else "user",
+                                "content": line,
+                                "createdAt": "",
+                            }
+                            for idx, line in enumerate(
+                                state.get("live_conversation", [])
+                            )
+                        ],
+                        "limits": {"offloads": 2, "liveMessages": 6},
+                    },
+                    on_metrics=on_progress,
+                )
+                relevant_offloads = map_selected(
+                    state.get("offloaded_context", []),
+                    selected["offloadIds"],
+                    "offload",
+                )
+                relevant_live = map_selected(
+                    state.get("live_conversation", []),
+                    selected["liveMessageIds"],
+                    "live",
+                )
 
                 if control_flags["stop_round"]:
                     if on_progress:
@@ -456,6 +592,7 @@ class DeepAgentService:
                     thread_inputs,
                     state["user_message"],
                 )
+                worker_started = time.perf_counter()
                 try:
                     worker_result = await self.codex.run_streaming(
                         repo_path=state["repo_path"],
@@ -472,7 +609,8 @@ class DeepAgentService:
                                         }
                                     )
                                 )
-                                if on_progress and (formatted := format_subagent_event(raw_event))
+                                if on_progress
+                                and (formatted := format_subagent_event(raw_event))
                                 else None
                             )
                         ),
@@ -490,9 +628,23 @@ class DeepAgentService:
                             )
                         )
                     raise
+                await emit_timing(
+                    stage="subagent_codex_run",
+                    started_at=worker_started,
+                    prompt_chars=len(worker_prompt),
+                    usage_total_tokens=int(
+                        getattr(worker_result.usage, "total", 0) or 0
+                    ),
+                    extra={
+                        "todo_id": task["id"],
+                        "todo_title": task.get("title", ""),
+                    },
+                )
                 summary = worker_result.assistant_message.strip() or "(empty)"
                 outputs.append(f"[{task['id']}] {summary}")
-                results.append({"todoId": task["id"], "status": "done", "summary": summary})
+                results.append(
+                    {"todoId": task["id"], "status": "done", "summary": summary}
+                )
                 if on_progress:
                     await maybe_await(
                         on_progress(
@@ -512,7 +664,8 @@ class DeepAgentService:
             await self.context_offload.compact_session(
                 session_key=state["session_key"],
                 summarize_offload=lambda offload: self.tools.invoke_summarize_offload(
-                    {"repoPath": state["repo_path"], "messages": offload["messages"]}
+                    {"repoPath": state["repo_path"], "messages": offload["messages"]},
+                    on_metrics=on_progress,
                 ),
             )
             all_results = [*prev_results, *results]
@@ -551,7 +704,28 @@ class DeepAgentService:
                             }
                         )
                     )
-                return {"done": True, "completion_reason": f"max-rounds-reached:{max_rounds}"}
+                return {
+                    "done": True,
+                    "completion_reason": f"max-rounds-reached:{max_rounds}",
+                }
+
+            latest_results = state.get("latest_todo_results", [])
+            if latest_results and all(
+                r.get("status") == "blocked" for r in latest_results
+            ):
+                if on_progress:
+                    await maybe_await(
+                        on_progress(
+                            {
+                                "stage": "planning",
+                                "message": "모든 TODO가 의존성 문제로 blocked 상태입니다. 현재 결과를 집계합니다.",
+                            }
+                        )
+                    )
+                return {
+                    "done": True,
+                    "completion_reason": "all-todos-blocked",
+                }
 
             decision = await self.tools.invoke_replan(
                 {
@@ -566,7 +740,8 @@ class DeepAgentService:
                     "currentRound": current_round,
                     "maxRounds": max_rounds,
                     "maxTasks": self.options.max_subagents,
-                }
+                },
+                on_metrics=on_progress,
             )
             if decision.get("done"):
                 if on_progress:
@@ -578,7 +753,10 @@ class DeepAgentService:
                             }
                         )
                     )
-                return {"done": True, "completion_reason": decision.get("reason", "complete")}
+                return {
+                    "done": True,
+                    "completion_reason": decision.get("reason", "complete"),
+                }
 
             next_todos = decision.get("nextTodos", [])
             if not next_todos:
@@ -602,25 +780,50 @@ class DeepAgentService:
 
         async def aggregate(state: DeepAgentState) -> DeepAgentState:
             if on_progress:
-                await maybe_await(on_progress({"stage": "aggregation", "message": "메인 에이전트가 서브에이전트 결과를 집계합니다."}))
+                await maybe_await(
+                    on_progress(
+                        {
+                            "stage": "aggregation",
+                            "message": "메인 에이전트가 서브에이전트 결과를 집계합니다.",
+                        }
+                    )
+                )
+            aggregation_prompt = build_aggregation_prompt(
+                state["user_message"],
+                state.get("todo_list", []),
+                state.get("todo_results", []),
+                state.get("subagent_outputs", []),
+                state.get("completion_reason", ""),
+            )
+            aggregate_started = time.perf_counter()
             aggregated = await self.codex.run(
                 repo_path=state["repo_path"],
-                prompt=build_aggregation_prompt(
-                    state["user_message"],
-                    state.get("todo_list", []),
-                    state.get("todo_results", []),
-                    state.get("subagent_outputs", []),
-                    state.get("completion_reason", ""),
-                ),
+                prompt=aggregation_prompt,
             )
-            return {"final_response": aggregated.assistant_message.strip() or "(empty response)"}
+            await emit_timing(
+                stage="aggregation",
+                started_at=aggregate_started,
+                prompt_chars=len(aggregation_prompt),
+                usage_total_tokens=int(getattr(aggregated.usage, "total", 0) or 0),
+            )
+            return {
+                "final_response": aggregated.assistant_message.strip()
+                or "(empty response)"
+            }
 
         async def filesystem_tool_node(state: DeepAgentState) -> DeepAgentState:
+            warpgrep_started = time.perf_counter()
             summaries = await collect_warpgrep_filesystem_context(
                 repo_path=state["repo_path"],
                 user_message=state["user_message"],
                 max_files=self.options.warpgrep_max_files,
                 max_depth=self.options.warpgrep_max_depth,
+            )
+            await emit_timing(
+                stage="warpgrep_context",
+                started_at=warpgrep_started,
+                prompt_chars=len(state["user_message"]),
+                extra={"warpgrep_hits": len(summaries)},
             )
             if summaries and on_progress:
                 await maybe_await(
@@ -632,7 +835,6 @@ class DeepAgentService:
                     )
                 )
             return {"filesystem_context": summaries}
-
 
         graph.add_node("save_user_request", save_user_request)
         graph.add_node("prepare_context", prepare_context)
@@ -648,13 +850,24 @@ class DeepAgentService:
         graph.add_edge(START, "save_user_request")
         graph.add_edge("save_user_request", "prepare_context")
         graph.add_edge("prepare_context", "route")
-        graph.add_conditional_edges("route", lambda s: "main_direct" if s.get("mode") == "main_direct" else "filesystem_tool")
+        graph.add_conditional_edges(
+            "route",
+            lambda s: (
+                "main_direct" if s.get("mode") == "main_direct" else "filesystem_tool"
+            ),
+        )
         graph.add_edge("main_direct", END)
         graph.add_edge("filesystem_tool", "plan")
         graph.add_edge("plan", "validate_todo_plan")
-        graph.add_conditional_edges("validate_todo_plan", lambda s: "aggregate" if s.get("done") else "run_subagents")
+        graph.add_conditional_edges(
+            "validate_todo_plan",
+            lambda s: "aggregate" if s.get("done") else "run_subagents",
+        )
         graph.add_edge("run_subagents", "review_and_replan")
-        graph.add_conditional_edges("review_and_replan", lambda s: "aggregate" if s.get("done") else "validate_todo_plan")
+        graph.add_conditional_edges(
+            "review_and_replan",
+            lambda s: "aggregate" if s.get("done") else "validate_todo_plan",
+        )
         graph.add_edge("aggregate", END)
 
         chain = graph.compile()
@@ -674,7 +887,9 @@ class DeepAgentService:
             subagent_count=state.get("subagent_count", 0),
         )
 
-    async def persist_turn(self, session_key: str, repo_path: str, assistant_message: str) -> dict[str, int]:
+    async def persist_turn(
+        self, session_key: str, repo_path: str, assistant_message: str
+    ) -> dict[str, int]:
         """턴 종료 시 assistant 응답만 저장 후 오프로드 (user 요청은 이미 save_user_request에서 저장됨)."""
         stats = await self.context_offload.persist_turn(
             session_key=session_key,
@@ -736,32 +951,27 @@ def build_warpgrep_filesystem_context(
         return []
 
     ranked: list[tuple[int, str, str]] = []
-    root = Path(repo_path)
-    if not root.exists() or not root.is_dir():
+    inventory = get_warpgrep_inventory(repo_path)
+    if not inventory:
         return []
 
-    summaries: list[str] = [f"[warpgrep] limits max_files={max_files} max_depth={max_depth}"]
+    summaries: list[str] = [
+        f"[warpgrep] limits max_files={max_files} max_depth={max_depth}"
+    ]
 
     scanned_files = 0
-    for dirpath, dirnames, filenames in os.walk(root):
-        rel_dir = Path(dirpath).relative_to(root)
-        rel_depth = 0 if str(rel_dir) == "." else len(rel_dir.parts)
-        dirnames[:] = [d for d in dirnames if d not in {".git", ".venv", "node_modules", "__pycache__", ".mypy_cache", ".pytest_cache"}]
-        if rel_depth >= max_depth:
-            dirnames[:] = []
-
-        for fname in filenames:
-            if scanned_files >= max_files:
-                break
-            scanned_files += 1
-            rel_path = (rel_dir / fname).as_posix() if str(rel_dir) != "." else fname
-            lower = rel_path.lower()
-            score = sum(1 for token in keywords if token in lower)
-            if score <= 0:
-                continue
-            ranked.append((score, rel_path, f"[warpgrep] file={rel_path} score={score}"))
+    for rel_path in inventory:
+        rel_depth = len(Path(rel_path).parts) - 1
+        if rel_depth > max_depth:
+            continue
         if scanned_files >= max_files:
             break
+        scanned_files += 1
+        lower = rel_path.lower()
+        score = sum(1 for token in keywords if token in lower)
+        if score <= 0:
+            continue
+        ranked.append((score, rel_path, f"[warpgrep] file={rel_path} score={score}"))
 
     ranked.sort(key=lambda x: (-x[0], x[1]))
     summaries.extend(item[2] for item in ranked[:limit])
@@ -788,7 +998,9 @@ def validate_todo_plan(tasks: list[dict[str, Any]]) -> list[str]:
 
     ids = [str(task.get("id", "")).strip() for task in tasks]
     errors: list[str] = []
-    duplicated = sorted({task_id for task_id in ids if task_id and ids.count(task_id) > 1})
+    duplicated = sorted(
+        {task_id for task_id in ids if task_id and ids.count(task_id) > 1}
+    )
     if duplicated:
         errors.append(f"duplicate ids: {', '.join(duplicated)}")
 
@@ -800,14 +1012,21 @@ def validate_todo_plan(tasks: list[dict[str, Any]]) -> list[str]:
         if not task_id:
             errors.append("task with empty id")
             continue
-        deps = [str(dep).strip() for dep in task.get("dependsOn", []) if str(dep).strip()]
-        graph[task_id] = deps
+        deps = [
+            str(dep).strip() for dep in task.get("dependsOn", []) if str(dep).strip()
+        ]
+        merged_deps = graph.setdefault(task_id, [])
+        for dep in deps:
+            if dep not in merged_deps:
+                merged_deps.append(dep)
         for dep in deps:
             if dep not in id_set:
                 undefined_refs.add(f"{task_id}->{dep}")
 
     if undefined_refs:
-        errors.append(f"undefined dependsOn references: {', '.join(sorted(undefined_refs))}")
+        errors.append(
+            f"undefined dependsOn references: {', '.join(sorted(undefined_refs))}"
+        )
 
     visiting: set[str] = set()
     visited: set[str] = set()
@@ -864,12 +1083,18 @@ def build_subagent_prompt(
     safe_task = {
         "id": sanitize_prompt_segment(str(task.get("id", "")), 80),
         "title": sanitize_prompt_segment(str(task.get("title", "")), 240),
-        "instructions": sanitize_prompt_segment(str(task.get("instructions", "")), 2400),
-        "doneDefinition": sanitize_prompt_segment(str(task.get("doneDefinition", "")), 600),
+        "instructions": sanitize_prompt_segment(
+            str(task.get("instructions", "")), 2400
+        ),
+        "doneDefinition": sanitize_prompt_segment(
+            str(task.get("doneDefinition", "")), 600
+        ),
     }
     safe_offloads = [sanitize_prompt_segment(x, 900) for x in offloaded_context[:6]]
     safe_live = [sanitize_prompt_segment(x, 700) for x in live_conversation[:10]]
-    safe_thread_inputs = [sanitize_prompt_segment(x, 700) for x in thread_user_inputs[:10]]
+    safe_thread_inputs = [
+        sanitize_prompt_segment(x, 700) for x in thread_user_inputs[:10]
+    ]
     safe_user_message = sanitize_prompt_segment(user_message, 1200)
     return "\n".join(
         [
@@ -934,7 +1159,9 @@ def build_todo_list_message(tasks: list[dict[str, Any]]) -> str:
     lines = ["TODO 생성 결과:"]
     for task in tasks:
         depends = ",".join(task.get("dependsOn", [])) or "-"
-        lines.append(f"- {task.get('id','?')} | {task.get('title','(no-title)')} | dependsOn={depends}")
+        lines.append(
+            f"- {task.get('id', '?')} | {task.get('title', '(no-title)')} | dependsOn={depends}"
+        )
     return "\n".join(lines)
 
 
@@ -945,7 +1172,11 @@ def format_subagent_event(event: dict[str, Any]) -> str | None:
         item_type = str(item.get("type", "unknown"))
         if item_type == "agent_message":
             text = str(item.get("text", "")).strip()
-            return f"agent_message: {truncate(text, 260)}" if text else "agent_message: (empty)"
+            return (
+                f"agent_message: {truncate(text, 260)}"
+                if text
+                else "agent_message: (empty)"
+            )
         return None
     return None
 

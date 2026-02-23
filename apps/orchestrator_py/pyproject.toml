@@ -20,6 +20,7 @@ dev = [
 
 [project.scripts]
 orchestrator = "orchestrator.main:run"
+orchestrator-baseline = "orchestrator.benchmarks.baseline_report:run"
 
 [build-system]
 requires = ["hatchling>=1.25.0"]

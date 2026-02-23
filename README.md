@@ -18,7 +18,7 @@ DM이나 멘션으로 말 걸면, 자연어 요청을 TODO로 쪼개고 Codex로
 - **컨텍스트 로테이션** – 오프로드가 많아지면 **active / archive 카테고리**를 사용해 새 채널을 만들고, 기존 채널은 아카이브로 옮긴 뒤 새 대화는 새 채널에서 이어간다.
 - **HITL(선택)** – 위험도가 높다고 판단되면 승인 대기 후 실행할 수 있다.
 - **서브에이전트 스레드** – TODO 하나마다 Discord 스레드를 만들어 진행 상황을 따로 보고한다.
-- **스레드 제어 명령** – `!pause`, `!resume`, `!stop` 명령으로 진행 중인 작업을 제어할 수 있다.
+- **스레드 제어 명령** – `!skip`, `!stop-round`, `!abort` (또는 `/skip`, `/stop-round`, `/abort`) 명령으로 진행 중인 작업을 제어할 수 있다.
 - **메모** – 채널 토픽에 저장된 메모를 조회하는 명령을 지원한다.
 
 ### Codex 오케스트레이션
@@ -85,7 +85,7 @@ uv run --directory apps/orchestrator_py orchestrator
 | 명령 | 설명 |
 |------|------|
 | `uv run --directory apps/orchestrator_py orchestrator` | 오케스트레이터 실행 |
-| `uv run --directory apps/orchestrator_py run --extra dev pytest -q` | 테스트 실행 |
+| `uv run --directory apps/orchestrator_py --extra dev pytest -q` | 테스트 실행 |
 
 ---
 
@@ -93,8 +93,12 @@ uv run --directory apps/orchestrator_py orchestrator
 
 | 변수 | 기본값 | 설명 |
 |------|--------|------|
+| `LOG_LEVEL` | `info` | 로그 레벨 |
 | `DISCORD_BOT_TOKEN` | (필수) | Discord 봇 토큰 |
 | `NATURAL_CHAT_ENABLED` | `true` | 자연어 채팅 처리 사용 여부 |
+| `DISCORD_DM_POLICY` | `open` | DM 정책 (`open` / `pairing`) |
+| `DISCORD_ALLOWLIST_USER_IDS` | (비어 있음) | 허용된 유저 ID 목록 (쉼표 구분) |
+| `DISCORD_PAIRING_STORE` | `.opendora/pairing.json` | 페어링 정보 저장 경로 |
 | `HITL_REQUIRED` | `false` | 위험 작업 시 사람 승인 필수 여부 |
 | `HITL_TTL_SEC` | `600` | 승인 대기 유효 시간(초) |
 | `DEFAULT_REPO_PATH` | `.` | 기본 작업 디렉터리(레포 경로) |
@@ -103,12 +107,21 @@ uv run --directory apps/orchestrator_py orchestrator
 | `CONTEXT_MAX_ESTIMATED_TOKENS` | `12000` | 컨텍스트당 최대 토큰 수(추정) |
 | `CONTEXT_KEEP_RECENT_MESSAGES` | `10` | 유지할 최근 메시지 개수 |
 | `CONTEXT_RETRIEVE_TOP_K` | `4` | 검색 시 가져올 오프로드 개수 |
+| `CONTEXT_SESSION_CACHE_SIZE` | `32` | 세션 캐시 크기 |
 | `CONTEXT_CHANNEL_ROUTER_ENABLED` | `true` | 모델 기반 채널·카테고리 라우팅(자동 생성) 사용 여부 |
 | `CONTEXT_CHANNEL_ROTATION_ENABLED` | `false` | 오프로드 많을 때 채널 로테이션(active/archive) 사용 여부 |
 | `CONTEXT_CHANNEL_ROTATION_MAX_OFFLOADS` | `24` | 로테이션 트리거 오프로드 개수 |
 | `CONTEXT_CHANNEL_ROTATION_MAX_LIVE_MESSAGES` | `80` | 로테이션 트리거 최대 라이브 메시지 수 |
 | `CONTEXT_ACTIVE_CATEGORY_NAME` | `opendora-active` | 로테이션 시 새 채널을 둘 카테고리 이름 |
 | `CONTEXT_ARCHIVE_CATEGORY_NAME` | `opendora-archive` | 로테이션 시 기존 채널을 옮길 아카이브 카테고리 이름 |
+| `RUN_ARTIFACTS_ENABLED` | `true` | 실행 결과 저장 여부 |
+| `RUN_ARTIFACTS_DIR` | `.opendora/runs` | 실행 결과 저장 디렉터리 |
+| `RUN_ARTIFACTS_REDACT` | `true` | 실행 결과 민감 정보 마스킹 여부 |
+| `RUN_ARTIFACTS_MAX_BYTES` | `2000000` | 실행 결과 최대 크기(바이트) |
+| `RUN_ARTIFACTS_RETENTION_DAYS` | `7` | 실행 결과 보관 기간(일) |
+| `RUN_DEBUG_PROMPTS` | `false` | 프롬프트 디버그 출력 여부 |
+| `DISCORD_PROGRESS_THROTTLE_MS` | `1000` | 진행 상황 업데이트 간격(ms) |
+| `DISCORD_PROGRESS_MAX_BUFFERED` | `20` | 진행 상황 버퍼링 최대 개수 |
 | `DEEP_AGENT_ENABLED` | `true` | Deep Agent(TODO·서브에이전트) 사용 여부 |
 | `DEEP_AGENT_MAX_SUBAGENTS` | `3` | 한 번에 둘 수 있는 서브에이전트(라운드당) 상한 |
 | `DEEP_AGENT_MAX_ROUNDS` | `3` | Deep Agent 재계획 최대 라운드 수(1 이상) |
@@ -117,9 +130,12 @@ uv run --directory apps/orchestrator_py orchestrator
 | `CODEX_BIN` | `codex` | Codex CLI 실행 파일 이름 |
 | `CODEX_TIMEOUT_MS` | `900000` | Codex 실행 타임아웃(ms) |
 | `CODEX_MODEL` | (비어 있음) | Codex 모델 오버라이드(선택) |
+| `CODEX_MODEL_CANDIDATES` | (비어 있음) | Codex 모델 후보 목록 |
 | `CODEX_SANDBOX` | `workspace-write` | Codex 샌드박스 모드 |
 | `CODEX_RETRY_COUNT` | `2` | Codex 일시적 실패 시 재시도 횟수 |
 | `CODEX_RETRY_BACKOFF_MS` | `250` | 재시도 백오프 기본 간격(ms) |
+| `MCP_ENABLED` | `false` | MCP 사용 여부 |
+| `MCP_SERVER_URLS` | (비어 있음) | MCP 서버 URL 목록 |
 
 ---
 

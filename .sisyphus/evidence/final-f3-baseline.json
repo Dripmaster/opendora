@@ -1,0 +1,28 @@
+{
+  "schema_version": "1.0",
+  "generated_at": "2026-02-23T08:41:13.714212+00:00",
+  "fixture": {
+    "sessions": 200,
+    "repo_files": 240
+  },
+  "durations_ms": {
+    "list_related_session_candidates": 1.592,
+    "build_capsule": 0.595,
+    "warpgrep_inventory_build": 3.053
+  },
+  "results": {
+    "candidate_count": 12,
+    "capsule": {
+      "used_offloads": 1,
+      "live_messages": 2,
+      "offloaded_context_count": 1,
+      "live_conversation_count": 2
+    },
+    "warpgrep_inventory_count": 240
+  },
+  "artifacts": {
+    "enabled": true,
+    "written": true,
+    "path": "/home/wbsoft/omo/opendora/apps/orchestrator_py/.opendora/runs/baseline-20260223084113/benchmarks/baseline_report.json"
+  }
+}

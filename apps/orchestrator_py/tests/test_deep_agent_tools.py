@@ -3,7 +3,11 @@ from dataclasses import dataclass
 import pytest
 
 from orchestrator.services.codex_cli_runtime import CodexRunResult, Usage
-from orchestrator.services.deep_agent_tools import DeepAgentToolsService, RouteDecision, extract_json_line
+from orchestrator.services.deep_agent_tools import (
+    DeepAgentToolsService,
+    RouteDecision,
+    extract_json_line,
+)
 
 
 @dataclass
@@ -12,7 +16,14 @@ class FakeCodex:
 
     async def run(self, repo_path: str, prompt: str):
         text = self.outputs.pop(0)
-        return CodexRunResult(assistant_message=text, usage=Usage(), thread_id=None, events=[])
+        return CodexRunResult(
+            assistant_message=text,
+            usage=Usage(),
+            thread_id=None,
+            events=[],
+            duration_ms=1,
+            prompt_chars=len(prompt),
+        )
 
 
 async def test_tools_retry_json_then_succeed() -> None:
@@ -83,8 +94,10 @@ async def test_run_json_with_retry_includes_last_output_on_failure() -> None:
     tools = DeepAgentToolsService(codex=codex)  # type: ignore[arg-type]
 
     with pytest.raises(ValueError) as exc_info:
-        await tools._run_json_with_retry(repo_path='.', prompt='x', attempts=1, schema=RouteDecision)
+        await tools._run_json_with_retry(
+            repo_path=".", prompt="x", attempts=1, schema=RouteDecision
+        )
 
     message = str(exc_info.value)
-    assert 'last_error=schema_failed' in message
+    assert "last_error=schema_failed" in message
     assert '{"unexpected":"shape"}' in message

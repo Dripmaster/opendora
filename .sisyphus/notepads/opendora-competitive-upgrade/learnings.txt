@@ -1,0 +1,1 @@
+Task 16: Updated README.md and .env.example to sync with AppEnv. Added test_docs_env_vars.py to ensure they stay in sync. Corrected pytest command in README.md.
