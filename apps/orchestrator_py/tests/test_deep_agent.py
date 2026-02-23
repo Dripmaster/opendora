@@ -2,7 +2,7 @@ import inspect
 from dataclasses import dataclass
 
 from orchestrator.services.context_offload import ContextOffloadOptions, ContextOffloadService
-from orchestrator.services.deep_agent import DeepAgentOptions, DeepAgentService
+from orchestrator.services.deep_agent import DeepAgentOptions, DeepAgentService, validate_todo_plan
 from orchestrator.services.deep_agent_tools import DeepAgentToolsService
 
 
@@ -125,3 +125,67 @@ async def test_deep_agent_filesystem_tool_node_injects_warpgrep_context(tmp_path
     assert result.mode == "subagent_pipeline"
     plan_prompt = codex.prompts[2]  # 0=select_context, 1=route, 2=plan
     assert "[warpgrep] file=warpgrep_pattern_docs.txt" in plan_prompt
+
+
+async def test_deep_agent_invalid_plan_replans_before_running_subagents(tmp_path):
+    codex = FakeCodex(
+        [
+            '{"offloadIds":[],"liveMessageIds":[]}',
+            '{"mode":"subagent_pipeline","reason":"complex"}',
+            '{"todos":[{"id":"T1","title":"first","instructions":"do-1","priority":"high","dependsOn":[],"doneDefinition":"done"},{"id":"T1","title":"dup","instructions":"do-dup","priority":"high","dependsOn":[],"doneDefinition":"done"}]}',
+            '{"done":false,"reason":"fix invalid plan","nextTodos":[{"id":"T2","title":"valid","instructions":"do-2","priority":"high","dependsOn":[],"doneDefinition":"done"}]}',
+            '{"offloadIds":[],"liveMessageIds":[]}',
+            'replanned-output',
+            '{"done":true,"reason":"complete","nextTodos":[]}',
+            'final-aggregate',
+        ]
+    )
+    tools = DeepAgentToolsService(codex=codex)  # type: ignore[arg-type]
+    context = ContextOffloadService(
+        ContextOffloadOptions(True, str(tmp_path / "ctx"), 12000, 10, 4)
+    )
+    agent = DeepAgentService(codex=codex, context_offload=context, tools=tools, options=DeepAgentOptions(True, 3))  # type: ignore[arg-type]
+
+    result = await agent.execute("c:u", "build this", ".")
+
+    assert result.mode == "subagent_pipeline"
+    assert result.subagent_count == 1
+    assert result.final_response == "final-aggregate"
+
+
+async def test_deep_agent_invalid_plan_and_invalid_replan_finishes_safely(tmp_path):
+    codex = FakeCodex(
+        [
+            '{"offloadIds":[],"liveMessageIds":[]}',
+            '{"mode":"subagent_pipeline","reason":"complex"}',
+            '{"todos":[{"id":"T1","title":"first","instructions":"do-1","priority":"high","dependsOn":["T9"],"doneDefinition":"done"}]}',
+            '{"done":false,"reason":"try again","nextTodos":[{"id":"T2","title":"still bad","instructions":"do-2","priority":"high","dependsOn":["TX"],"doneDefinition":"done"}]}',
+            'safe-final',
+        ]
+    )
+    tools = DeepAgentToolsService(codex=codex)  # type: ignore[arg-type]
+    context = ContextOffloadService(
+        ContextOffloadOptions(True, str(tmp_path / "ctx"), 12000, 10, 4)
+    )
+    agent = DeepAgentService(codex=codex, context_offload=context, tools=tools, options=DeepAgentOptions(True, 3))  # type: ignore[arg-type]
+
+    result = await agent.execute("c:u", "build this", ".")
+
+    assert result.mode == "subagent_pipeline"
+    assert result.subagent_count == 0
+    assert result.final_response == "safe-final"
+    assert "invalid-todo-plan:replan-invalid" in codex.prompts[-1]
+
+
+def test_validate_todo_plan_detects_duplicate_undefined_and_cycle():
+    errors = validate_todo_plan(
+        [
+            {"id": "T1", "dependsOn": ["T2"]},
+            {"id": "T2", "dependsOn": ["T1", "T9"]},
+            {"id": "T1", "dependsOn": []},
+        ]
+    )
+
+    assert any("duplicate ids" in item for item in errors)
+    assert any("undefined dependsOn references" in item for item in errors)
+    assert any("cyclic dependency detected" in item for item in errors)

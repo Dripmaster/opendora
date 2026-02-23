@@ -204,6 +204,81 @@ class DeepAgentService:
                 )
             return {"todo_list": tasks, "todo_results": [], "subagent_outputs": [], "round": 1}
 
+        async def validate_todo_plan_node(state: DeepAgentState) -> DeepAgentState:
+            tasks = state.get("todo_list", [])
+            validation_errors = validate_todo_plan(tasks)
+            if not validation_errors:
+                return {"done": False}
+
+            error_text = "; ".join(validation_errors)
+            if on_progress:
+                await maybe_await(
+                    on_progress(
+                        {
+                            "stage": "planning",
+                            "message": f"TODO 플랜 검증 실패: {error_text}",
+                        }
+                    )
+                )
+
+            current_round = state.get("round", 1)
+            if current_round >= max_rounds:
+                return {
+                    "done": True,
+                    "completion_reason": f"invalid-todo-plan:max-rounds-reached:{error_text}",
+                }
+
+            decision = await self.tools.invoke_replan(
+                {
+                    "repoPath": state["repo_path"],
+                    "userMessage": state["user_message"],
+                    "offloadedContext": state.get("offloaded_context", []),
+                    "liveConversation": state.get("live_conversation", []),
+                    "currentTodoList": tasks,
+                    "allTodoResults": state.get("todo_results", []),
+                    "latestTodoResults": state.get("latest_todo_results", []),
+                    "allOutputs": state.get("subagent_outputs", []),
+                    "currentRound": current_round,
+                    "maxRounds": max_rounds,
+                    "maxTasks": self.options.max_subagents,
+                }
+            )
+            if decision.get("done"):
+                return {
+                    "done": True,
+                    "completion_reason": f"invalid-todo-plan:replan-done:{decision.get('reason', 'complete')}",
+                }
+
+            next_todos = decision.get("nextTodos", [])
+            if not next_todos:
+                return {
+                    "done": True,
+                    "completion_reason": "invalid-todo-plan:replan-empty-next-todos",
+                }
+
+            next_errors = validate_todo_plan(next_todos)
+            if next_errors:
+                return {
+                    "done": True,
+                    "completion_reason": f"invalid-todo-plan:replan-invalid:{'; '.join(next_errors)}",
+                }
+
+            if on_progress:
+                await maybe_await(
+                    on_progress(
+                        {
+                            "stage": "planning",
+                            "message": f"유효한 TODO 플랜으로 재계획 완료. 라운드 {current_round + 1} 진행.",
+                        }
+                    )
+                )
+            return {
+                "done": False,
+                "completion_reason": f"invalid-todo-plan:replanned:{decision.get('reason', 'needs-more-work')}",
+                "todo_list": next_todos,
+                "round": current_round + 1,
+            }
+
         async def run_subagents(state: DeepAgentState) -> DeepAgentState:
             # 서브에이전트한테 일 할당 전 오프로드
             await self.context_offload.compact_session(
@@ -466,6 +541,7 @@ class DeepAgentService:
         graph.add_node("filesystem_tool", filesystem_tool_node)
         graph.add_node("main_direct", main_direct)
         graph.add_node("plan", plan)
+        graph.add_node("validate_todo_plan", validate_todo_plan_node)
         graph.add_node("run_subagents", run_subagents)
         graph.add_node("review_and_replan", review_and_replan)
         graph.add_node("aggregate", aggregate)
@@ -476,9 +552,10 @@ class DeepAgentService:
         graph.add_conditional_edges("route", lambda s: "main_direct" if s.get("mode") == "main_direct" else "filesystem_tool")
         graph.add_edge("main_direct", END)
         graph.add_edge("filesystem_tool", "plan")
-        graph.add_edge("plan", "run_subagents")
+        graph.add_edge("plan", "validate_todo_plan")
+        graph.add_conditional_edges("validate_todo_plan", lambda s: "aggregate" if s.get("done") else "run_subagents")
         graph.add_edge("run_subagents", "review_and_replan")
-        graph.add_conditional_edges("review_and_replan", lambda s: "aggregate" if s.get("done") else "run_subagents")
+        graph.add_conditional_edges("review_and_replan", lambda s: "aggregate" if s.get("done") else "validate_todo_plan")
         graph.add_edge("aggregate", END)
 
         chain = graph.compile()
@@ -561,6 +638,55 @@ def map_selected(items: list[str], selected_ids: list[str], prefix: str) -> list
         if 0 <= idx < len(items):
             mapped.append(items[idx])
     return mapped
+
+
+def validate_todo_plan(tasks: list[dict[str, Any]]) -> list[str]:
+    if not tasks:
+        return ["empty todo list"]
+
+    ids = [str(task.get("id", "")).strip() for task in tasks]
+    errors: list[str] = []
+    duplicated = sorted({task_id for task_id in ids if task_id and ids.count(task_id) > 1})
+    if duplicated:
+        errors.append(f"duplicate ids: {', '.join(duplicated)}")
+
+    id_set = {task_id for task_id in ids if task_id}
+    undefined_refs: set[str] = set()
+    graph: dict[str, list[str]] = {}
+    for task in tasks:
+        task_id = str(task.get("id", "")).strip()
+        if not task_id:
+            errors.append("task with empty id")
+            continue
+        deps = [str(dep).strip() for dep in task.get("dependsOn", []) if str(dep).strip()]
+        graph[task_id] = deps
+        for dep in deps:
+            if dep not in id_set:
+                undefined_refs.add(f"{task_id}->{dep}")
+
+    if undefined_refs:
+        errors.append(f"undefined dependsOn references: {', '.join(sorted(undefined_refs))}")
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def has_cycle(node: str) -> bool:
+        if node in visited:
+            return False
+        if node in visiting:
+            return True
+        visiting.add(node)
+        for dep in graph.get(node, []):
+            if dep in graph and has_cycle(dep):
+                return True
+        visiting.remove(node)
+        visited.add(node)
+        return False
+
+    if any(has_cycle(node) for node in graph):
+        errors.append("cyclic dependency detected")
+
+    return errors
 
 
 def build_main_direct_prompt(state: DeepAgentState) -> str:
