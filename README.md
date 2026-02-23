@@ -18,6 +18,7 @@ DM이나 멘션으로 말 걸면, 자연어 요청을 TODO로 쪼개고 Codex로
 - **컨텍스트 로테이션** – 오프로드가 많아지면 **active / archive 카테고리**를 사용해 새 채널을 만들고, 기존 채널은 아카이브로 옮긴 뒤 새 대화는 새 채널에서 이어간다.
 - **HITL(선택)** – 위험도가 높다고 판단되면 승인 대기 후 실행할 수 있다.
 - **서브에이전트 스레드** – TODO 하나마다 Discord 스레드를 만들어 진행 상황을 따로 보고한다.
+- **스레드 제어 명령** – `!pause`, `!resume`, `!stop` 명령으로 진행 중인 작업을 제어할 수 있다.
 - **메모** – 채널 토픽에 저장된 메모를 조회하는 명령을 지원한다.
 
 ### Codex 오케스트레이션
@@ -25,6 +26,7 @@ DM이나 멘션으로 말 걸면, 자연어 요청을 TODO로 쪼개고 Codex로
 - **원격 실행** – 로컬에 설치된 Codex CLI를 호출해 실제 코드 실행을 맡긴다.
 - **샌드박스** – `read-only` / `workspace-write` / `danger-full-access` 중 선택 가능하다.
 - **타임아웃** – 실행 시간 상한을 두어 무한 대기를 막는다.
+- **자동 재시도** – 일시적 실패 시 지수 백오프로 자동 재시도한다.
 
 ### 컨텍스트 오프로드
 
@@ -35,8 +37,10 @@ DM이나 멘션으로 말 걸면, 자연어 요청을 TODO로 쪼개고 Codex로
 ### Deep Agent (LangGraph)
 
 - **모드 라우팅** – 요청이 단순하면 바로 답변, 복잡하면 TODO 플랜을 세운다.
+- **TODO 계획 검증** – 생성된 TODO 플랜이 유효한지 검증하고, 잘못된 경우 재생성한다.
 - **TODO 계획** – 자연어 요청을 의존 관계가 있는 TODO 리스트로 분해한다.
 - **서브에이전트** – TODO 단위로 Codex를 호출하고, 결과를 모아 다음 단계나 최종 답변을 만든다.
+- **Warpgrep 도구** – 파일시스템 검색을 위한 Warpgrep 도구 노드를 제공한다.
 - **재계획** – 중간 결과를 보고 추가 TODO가 필요하면 다음 라운드를 돌린다.
 - **다중 라운드** – 설정한 최대 라운드까지 반복해 목표를 채운다.
 
@@ -101,15 +105,21 @@ uv run --directory apps/orchestrator_py orchestrator
 | `CONTEXT_RETRIEVE_TOP_K` | `4` | 검색 시 가져올 오프로드 개수 |
 | `CONTEXT_CHANNEL_ROUTER_ENABLED` | `true` | 모델 기반 채널·카테고리 라우팅(자동 생성) 사용 여부 |
 | `CONTEXT_CHANNEL_ROTATION_ENABLED` | `false` | 오프로드 많을 때 채널 로테이션(active/archive) 사용 여부 |
+| `CONTEXT_CHANNEL_ROTATION_MAX_OFFLOADS` | `24` | 로테이션 트리거 오프로드 개수 |
+| `CONTEXT_CHANNEL_ROTATION_MAX_LIVE_MESSAGES` | `80` | 로테이션 트리거 최대 라이브 메시지 수 |
 | `CONTEXT_ACTIVE_CATEGORY_NAME` | `opendora-active` | 로테이션 시 새 채널을 둘 카테고리 이름 |
 | `CONTEXT_ARCHIVE_CATEGORY_NAME` | `opendora-archive` | 로테이션 시 기존 채널을 옮길 아카이브 카테고리 이름 |
 | `DEEP_AGENT_ENABLED` | `true` | Deep Agent(TODO·서브에이전트) 사용 여부 |
 | `DEEP_AGENT_MAX_SUBAGENTS` | `3` | 한 번에 둘 수 있는 서브에이전트(라운드당) 상한 |
 | `DEEP_AGENT_MAX_ROUNDS` | `3` | Deep Agent 재계획 최대 라운드 수(1 이상) |
+| `WARPGREP_MAX_FILES` | `200` | Warpgrep 파일시스템 스캔 최대 파일 수 |
+| `WARPGREP_MAX_DEPTH` | `4` | Warpgrep 파일시스템 스캔 최대 깊이 |
 | `CODEX_BIN` | `codex` | Codex CLI 실행 파일 이름 |
 | `CODEX_TIMEOUT_MS` | `900000` | Codex 실행 타임아웃(ms) |
 | `CODEX_MODEL` | (비어 있음) | Codex 모델 오버라이드(선택) |
 | `CODEX_SANDBOX` | `workspace-write` | Codex 샌드박스 모드 |
+| `CODEX_RETRY_COUNT` | `2` | Codex 일시적 실패 시 재시도 횟수 |
+| `CODEX_RETRY_BACKOFF_MS` | `250` | 재시도 백오프 기본 간격(ms) |
 
 ---
 
