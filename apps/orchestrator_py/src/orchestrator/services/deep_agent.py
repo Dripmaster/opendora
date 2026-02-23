@@ -103,6 +103,7 @@ class DeepAgentService:
             external_count = 0
             candidates = self.context_offload.list_related_session_candidates(
                 current_session_key=state["session_key"],
+                query=state["user_message"],
                 limit=12,
             )
             if candidates:
