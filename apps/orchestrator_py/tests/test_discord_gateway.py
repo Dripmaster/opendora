@@ -7,11 +7,13 @@ from orchestrator.adapters.discord_gateway import (
     ThreadRoute,
     append_memo_to_topic,
     build_agent_run_memo_line,
+    encode_todo_control_command,
     build_rotated_channel_name,
     is_thread_channel,
     normalize_category_name,
     normalize_channel_name,
     parse_memo_view_command,
+    parse_todo_control_command,
     read_topic_memos,
     should_rotate_context_channel,
 )
@@ -308,3 +310,35 @@ async def test_agent_run_auto_memo_and_view_command():
     view.channel = m.channel
     await gateway.handle_message(view)
     assert any("현재 채널 메모" in x for x in view.replies)
+
+
+async def test_thread_control_command_is_encoded_and_routed():
+    env = AppEnv.model_validate(
+        {
+            "DISCORD_BOT_TOKEN": "x",
+            "NATURAL_CHAT_ENABLED": True,
+            "HITL_REQUIRED": False,
+            "HITL_TTL_SEC": 600,
+            "DEFAULT_REPO_PATH": ".",
+        }
+    )
+    gateway = DiscordGateway(env, FakeDeepAgent(), FakeLogger())  # type: ignore[arg-type]
+    gateway.thread_routes["thread-1"] = ThreadRoute(
+        request_id="r1",
+        session_key="c1:u1",
+        todo_id="T2",
+        queue_key="r1:T2",
+    )
+
+    m = FakeMessage("/skip", user_id="u1", channel_id="thread-1")
+    await gateway.handle_message(m)
+
+    assert gateway.todo_input_queues["r1:T2"] == [encode_todo_control_command("skip")]
+    assert any("제어 명령 반영됨: T2 (skip)" in x for x in m.replies)
+
+
+def test_parse_todo_control_command():
+    assert parse_todo_control_command("/skip") == "skip"
+    assert parse_todo_control_command("  /stop-round  ") == "stop-round"
+    assert parse_todo_control_command("/abort") == "abort"
+    assert parse_todo_control_command("/unknown") is None
