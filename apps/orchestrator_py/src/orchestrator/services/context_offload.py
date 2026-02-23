@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 
 class ContextSelector(Protocol):
@@ -208,6 +208,7 @@ class ContextOffloadService:
     def list_related_session_candidates(
         self,
         current_session_key: str,
+        query: str = "",
         limit: int = 12,
     ) -> list[ExternalSessionCandidate]:
         if not self.options.enabled:
@@ -219,7 +220,8 @@ class ContextOffloadService:
         if not sessions_dir.exists():
             return []
 
-        items: list[ExternalSessionCandidate] = []
+        query_keywords = extract_keywords(query)
+        scored_items: list[tuple[int, ExternalSessionCandidate]] = []
         for path in sessions_dir.glob("*.json"):
             try:
                 raw = json.loads(path.read_text("utf-8"))
@@ -237,18 +239,18 @@ class ContextOffloadService:
             summary = summarize_session_for_candidate(messages=messages, offloads=offloads)
             if not summary:
                 continue
-            items.append(
-                ExternalSessionCandidate(
-                    session_key=session_key,
-                    channel_id=session_channel_id(session_key),
-                    updated_at=str(raw.get("updatedAt") or ""),
-                    offload_count=len(offloads),
-                    live_message_count=len(messages),
-                    summary=summary,
-                )
+            candidate = ExternalSessionCandidate(
+                session_key=session_key,
+                channel_id=session_channel_id(session_key),
+                updated_at=str(raw.get("updatedAt") or ""),
+                offload_count=len(offloads),
+                live_message_count=len(messages),
+                summary=summary,
             )
-        items.sort(key=lambda x: x.updated_at, reverse=True)
-        return items[:limit]
+            score = score_by_query(summary, query_keywords)
+            scored_items.append((score, candidate))
+        scored_items.sort(key=lambda x: (x[0], x[1].updated_at), reverse=True)
+        return [x[1] for x in scored_items[:limit]]
 
     def build_capsule_from_session(
         self,
@@ -259,17 +261,68 @@ class ContextOffloadService:
         state = self._load_session(session_key)
         if not state["offloads"] and not state["messages"]:
             return ContextCapsule([], [], 0, 0)
-        offload_ids = [x["id"] for x in state["offloads"][-self.options.retrieve_top_k :]]
-        live_ids = [x["id"] for x in state["messages"][-self.options.keep_recent_messages :]]
+        query_keywords = extract_keywords(query)
+
+        offload_ids = select_top_k_ids(
+            items=state["offloads"],
+            query_keywords=query_keywords,
+            text_selector=lambda x: str(x.get("summary") or ""),
+            limit=self.options.retrieve_top_k,
+        )
+        live_ids = select_top_k_ids(
+            items=state["messages"],
+            query_keywords=query_keywords,
+            text_selector=lambda x: str(x.get("content") or ""),
+            limit=self.options.keep_recent_messages,
+        )
         picked_offloads = [x for x in state["offloads"] if x["id"] in offload_ids]
         picked_live = [x for x in state["messages"] if x["id"] in live_ids]
-        _ = query
         return ContextCapsule(
             offloaded_context=[sanitize_for_prompt(x["summary"], 1000) for x in picked_offloads],
             live_conversation=[f"[{x['role']}] {sanitize_for_prompt(x['content'], 1000)}" for x in picked_live],
             used_offloads=len(picked_offloads),
             live_messages=len(picked_live),
         )
+
+
+def score_by_query(text: str, query_keywords: list[str]) -> int:
+    if not query_keywords:
+        return 0
+    lowered = text.lower()
+    text_keywords = set(extract_keywords(text))
+    score = 0
+    for keyword in query_keywords:
+        if keyword in text_keywords:
+            score += 3
+        elif keyword in lowered:
+            score += 1
+    return score
+
+
+def select_top_k_ids(
+    items: list[dict[str, Any]],
+    query_keywords: list[str],
+    text_selector: Callable[[dict[str, Any]], str],
+    limit: int,
+) -> list[str]:
+    if limit <= 0:
+        return []
+    if not query_keywords:
+        return [str(x["id"]) for x in items[-limit:]]
+
+    scored: list[tuple[int, int, str]] = []
+    for idx, item in enumerate(items):
+        item_id = str(item.get("id") or "")
+        if not item_id:
+            continue
+        score = score_by_query(text_selector(item), query_keywords)
+        scored.append((score, idx, item_id))
+
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    selected = [item_id for score, _, item_id in scored[:limit] if score > 0]
+    if selected:
+        return selected
+    return [str(x["id"]) for x in items[-limit:]]
 
 
 async def summarize_chunk(chunk: list[dict[str, Any]], summarize_offload: OffloadSummarizer | None) -> dict[str, Any]:
