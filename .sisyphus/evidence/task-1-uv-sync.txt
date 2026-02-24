@@ -1,7 +1,0 @@
-Resolved 51 packages in 0.86ms
-Uninstalled 5 packages in 8ms
- - iniconfig==2.3.0
- - pluggy==1.6.0
- - pygments==2.19.2
- - pytest==9.0.2
- - pytest-asyncio==1.3.0
