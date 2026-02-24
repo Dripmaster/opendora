@@ -9,11 +9,12 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    env:
-      RUN_ARTIFACTS_DIR: ${{ runner.temp }}/opendora-runs
 
     steps:
     - uses: actions/checkout@v4
+
+    - name: Set run artifacts dir
+      run: echo "RUN_ARTIFACTS_DIR=${{ runner.temp }}/opendora-runs" >> $GITHUB_ENV
 
     - name: Install uv
       uses: astral-sh/setup-uv@v5
