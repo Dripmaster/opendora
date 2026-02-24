@@ -1,0 +1,3 @@
+./.sisyphus/plans/opendora-competitive-upgrade.md:45:- Prevent scope creep: explicitly exclude “full OpenClaw parity” (multi-channel/voice/UI) from MVP.
+./.sisyphus/plans/opendora-competitive-upgrade.md:76:- No adding 10+ messaging connectors / voice nodes / full web UI as part of MVP.
+./.sisyphus/drafts/opendora-competitive-gap.md:50:- EXCLUDE: full OpenClaw parity (multi-channel support, voice), unless explicitly selected.

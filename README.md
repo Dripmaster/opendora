@@ -41,8 +41,28 @@ DM이나 멘션으로 말 걸면, 자연어 요청을 TODO로 쪼개고 Codex로
 - **TODO 계획** – 자연어 요청을 의존 관계가 있는 TODO 리스트로 분해한다.
 - **서브에이전트** – TODO 단위로 Codex를 호출하고, 결과를 모아 다음 단계나 최종 답변을 만든다.
 - **Warpgrep 도구** – 파일시스템 검색을 위한 Warpgrep 도구 노드를 제공한다.
+- **Warpgrep 캐시** – 파일시스템 스캔 결과를 캐싱하여 대규모 레포지토리 탐색 성능을 최적화한다.
 - **재계획** – 중간 결과를 보고 추가 TODO가 필요하면 다음 라운드를 돌린다.
 - **다중 라운드** – 설정한 최대 라운드까지 반복해 목표를 채운다.
+
+### 관측성 및 디버깅 (Observability)
+
+- **Run Artifacts** – 모든 실행 과정과 단계별 추적 데이터를 `.opendora/runs/`에 저장한다.
+- **민감 정보 마스킹 (Redaction)** – 실행 로그 및 Artifact에서 Discord ID, 절대 경로, Prompt 등 민감 정보를 자동으로 마스킹한다.
+- **실행 요약 보고** – 작업 종료 후 시간, 토큰 사용량, 성공 여부 등에 대한 종합 보고서를 생성한다.
+- **구조화된 로깅** – 모든 이벤트와 에러를 구조화된 형태로 기록하여 추적성을 확보한다.
+
+### 보안 및 정책 (Security & Policy)
+
+- **Policy Engine** – 도구(Tool) 실행 전 권한을 검사하고 위험한 작업을 사전에 차단한다.
+- **Discord 페어링 및 화이트리스트** – 허용된 유저만 봇을 사용할 수 있도록 제한하며, DM 사용 시 페어링 과정을 거칠 수 있다.
+- **샌드박스 제어** – Codex 실행 시 권한 범위(`read-only` 등)를 강제하여 시스템을 보호한다.
+- **데이터 보존 정책** – 실행 결과(Artifacts)의 보관 기간을 설정하여 자동 관리한다.
+
+### 확장성 (Extensibility)
+
+- **MCP (Model Context Protocol) 지원** – 외부 도구 및 서버와의 표준화된 연동을 지원한다.
+- **Tool Registry** – 에이전트가 사용할 수 있는 도구들을 체계적으로 등록하고 관리한다.
 
 ---
 
@@ -86,6 +106,7 @@ uv run --directory apps/orchestrator_py orchestrator
 |------|------|
 | `uv run --directory apps/orchestrator_py orchestrator` | 오케스트레이터 실행 |
 | `uv run --directory apps/orchestrator_py --extra dev pytest -q` | 테스트 실행 |
+| `uv run --directory apps/orchestrator_py --extra dev pytest tests/test_run_artifacts.py` | Run Artifacts 기능 테스트 |
 
 ---
 
@@ -146,7 +167,7 @@ opendora/
   apps/orchestrator_py/
     src/orchestrator/
       adapters/          # Discord 연동 (discord_gateway)
-      services/          # Codex 런타임, 컨텍스트 오프로드, Deep Agent·도구
+      services/          # 핵심 비즈니스 로직 (런타임, 오프로드, Deep Agent, Policy, Artifacts 등)
     tests/
   .env.example
 ```
